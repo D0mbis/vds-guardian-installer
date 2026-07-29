@@ -1,0 +1,57 @@
+#!/bin/bash
+set -Eeuo pipefail
+PATH='/usr/sbin:/usr/bin:/sbin:/bin'
+umask 077
+export LC_ALL=C
+
+fail() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+[[ ${EUID} -eq 0 ]] || fail 'run this installer as root (for example: sudo bash install-existing.sh)'
+[[ $# -eq 0 ]] || fail 'this installer accepts no arguments'
+
+for command in install stat visudo bash sudo grep getent id mktemp; do
+  command -v "$command" >/dev/null 2>&1 || fail "required command is missing: $command"
+done
+
+hostname
+id
+getent passwd guardian >/dev/null || fail 'guardian account does not exist'
+
+if [[ -e /usr/local/sbin/vds-guardianctl || -e /etc/sudoers.d/vds-guardian ]]; then
+  fail 'guardian helper or sudoers file already exists; no changes made'
+fi
+
+for group in $(id -nG guardian); do
+  case "$group" in
+    guardian|users) ;;
+    *) fail "guardian has an unexpected supplemental group: $group" ;;
+  esac
+done
+
+current_sudo=$(sudo -U guardian -l 2>&1 || true)
+if printf '%s\n' "$current_sudo" | grep -Eq '^[[:space:]]+\('; then
+  fail 'guardian already has sudo commands; review them before changing access'
+fi
+
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT
+
+cat >"$tmpdir/vds-guardianctl" <<'VDS_GUARDIAN_HELPER'
+__HELPER__
+VDS_GUARDIAN_HELPER
+
+cat >"$tmpdir/vds-guardian.sudoers" <<'VDS_GUARDIAN_SUDOERS'
+__SUDOERS__
+VDS_GUARDIAN_SUDOERS
+
+bash -n "$tmpdir/vds-guardianctl"
+visudo -cf "$tmpdir/vds-guardian.sudoers"
+install -m 755 -o root -g root "$tmpdir/vds-guardianctl" /usr/local/sbin/vds-guardianctl
+install -m 440 -o root -g root "$tmpdir/vds-guardian.sudoers" /etc/sudoers.d/vds-guardian
+visudo -cf /etc/sudoers.d/vds-guardian
+stat -c '%U:%G %a %n' /usr/local/sbin/vds-guardianctl /etc/sudoers.d/vds-guardian
+sudo -u guardian sudo -n -l
+printf '%s\n' 'READY: fixed least-privilege maintenance helper installed for existing guardian account'

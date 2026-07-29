@@ -1,0 +1,18 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test installers
+        run: |
+          chmod +x tests/integration.sh
+          tests/integration.sh
