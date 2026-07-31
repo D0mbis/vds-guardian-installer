@@ -20,7 +20,11 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sudo openssh-client iprout
 if [[ '$mode' == new ]]; then
   ssh-keygen -q -t ed25519 -N '' -f /tmp/test_guardian_key
   public_key=\$(cat /tmp/test_guardian_key.pub)
-  bash /repo/dist/install-new.sh --public-key \"\$public_key\" >/tmp/install.log
+  enrollment_token='vg1_0123456789abcdefghijklmnopqrstuvwxyz_A-BCDE'
+  bash /repo/dist/install-new.sh --public-key \"\$public_key\" --enrollment-token \"\$enrollment_token\" >/tmp/install.log
+  ! grep -F \"\$enrollment_token\" /tmp/install.log
+  test \"\$(cat /home/guardian/.vds-guardian-enrollment)\" = \"\$enrollment_token\"
+  test \"\$(stat -c '%U:%G %a' /home/guardian/.vds-guardian-enrollment)\" = 'guardian:guardian 600'
 else
   adduser --disabled-password --gecos '' guardian >/dev/null
   bash /repo/dist/install-existing.sh >/tmp/install.log
@@ -77,7 +81,8 @@ groupadd docker
 printf "%s\n" "ADD_EXTRA_GROUPS=1" "EXTRA_GROUPS=\"docker\"" >>/etc/adduser.conf
 ssh-keygen -q -t ed25519 -N "" -f /tmp/test_guardian_key
 public_key=$(cat /tmp/test_guardian_key.pub)
-if bash /repo/dist/install-new.sh --public-key "$public_key" >/tmp/unexpected.log 2>&1; then
+enrollment_token='vg1_0123456789abcdefghijklmnopqrstuvwxyz_A-BCDE'
+if bash /repo/dist/install-new.sh --public-key "$public_key" --enrollment-token "$enrollment_token" >/tmp/unexpected.log 2>&1; then
   echo "new installer accepted an unexpected adduser group" >&2
   exit 42
 fi
@@ -88,4 +93,64 @@ fi
 test ! -e /usr/local/sbin/vds-guardianctl
 test ! -e /etc/sudoers.d/vds-guardian
 printf "%s\n" "unexpected_new_group_rejected_and_rolled_back"
+'
+
+docker run --rm -v "$ROOT:/repo:ro" "$IMAGE" bash -lc '
+set -Eeuo pipefail
+apt-get update -qq
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sudo openssh-client >/dev/null
+ssh-keygen -q -t ed25519 -N "" -f /tmp/test_guardian_key
+public_key=$(cat /tmp/test_guardian_key.pub)
+if bash /repo/dist/install-new.sh --public-key "$public_key" >/tmp/missing-token.log 2>&1; then
+  echo "new installer accepted a missing enrollment token" >&2
+  exit 51
+fi
+if bash /repo/dist/install-new.sh --public-key "$public_key" --enrollment-token "vg1_too-short" >/tmp/invalid-token.log 2>&1; then
+  echo "new installer accepted an invalid enrollment token" >&2
+  exit 52
+fi
+for invalid_token in \
+  "vg1_0123456789abcdefghijklmnopqrstuvwxyz_A-BCD" \
+  "vg1_0123456789abcdefghijklmnopqrstuvwxyz_A-BCDEF" \
+  "bad_0123456789abcdefghijklmnopqrstuvwxyz_A-BCDE" \
+  "vg1_0123456789abcdefghijklmnopqrstuvwxyz_A=BCDE"; do
+  if bash /repo/dist/install-new.sh --public-key "$public_key" --enrollment-token "$invalid_token" >/tmp/invalid-token.log 2>&1; then
+    echo "new installer accepted an invalid enrollment token" >&2
+    exit 53
+  fi
+  ! grep -F "$invalid_token" /tmp/invalid-token.log
+done
+valid_token="vg1_0123456789abcdefghijklmnopqrstuvwxyz_A-BCDE"
+if bash /repo/dist/install-new.sh --enrollment-token "$valid_token" --public-key "$public_key" >/tmp/wrong-order.log 2>&1; then
+  echo "new installer accepted reordered arguments" >&2
+  exit 54
+fi
+if bash /repo/dist/install-new.sh --public-key "$public_key" --enrollment-token "$valid_token" extra >/tmp/extra-argument.log 2>&1; then
+  echo "new installer accepted an extra argument" >&2
+  exit 55
+fi
+test ! -e /home/guardian
+test ! -e /usr/local/sbin/vds-guardianctl
+test ! -e /etc/sudoers.d/vds-guardian
+printf "%s\n" "invalid_enrollment_tokens_rejected"
+'
+
+docker run --rm -v "$ROOT:/repo:ro" "$IMAGE" bash -lc '
+set -Eeuo pipefail
+apt-get update -qq
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sudo openssh-client >/dev/null
+ssh-keygen -q -t ed25519 -N "" -f /tmp/test_guardian_key
+public_key=$(cat /tmp/test_guardian_key.pub)
+enrollment_token="vg1_0123456789abcdefghijklmnopqrstuvwxyz_A-BCDE"
+rm -rf /etc/sudoers.d
+if bash /repo/dist/install-new.sh --public-key "$public_key" --enrollment-token "$enrollment_token" >/tmp/rollback.log 2>&1; then
+  echo "new installer unexpectedly succeeded without /etc/sudoers.d" >&2
+  exit 61
+fi
+! grep -F "$enrollment_token" /tmp/rollback.log
+! getent passwd guardian >/dev/null
+test ! -e /home/guardian
+test ! -e /usr/local/sbin/vds-guardianctl
+test ! -e /etc/sudoers.d/vds-guardian
+printf "%s\n" "failed_install_rolled_back"
 '
