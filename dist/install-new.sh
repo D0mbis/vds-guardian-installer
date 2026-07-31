@@ -10,15 +10,24 @@ fail() {
 }
 
 usage() {
-  printf '%s\n' "Usage: sudo bash install-new.sh --public-key 'ssh-ed25519 AAAA...' --enrollment-token 'vg1_...'" >&2
+  printf '%s\n' "Usage: sudo bash install-new.sh --public-key 'ssh-ed25519 AAAA...' --enrollment-token-file /protected/path" >&2
   exit 2
 }
 
 [[ ${EUID} -eq 0 ]] || fail 'run this installer as root'
-[[ $# -eq 4 && $1 == '--public-key' && $3 == '--enrollment-token' ]] || usage
+[[ $# -eq 4 && $1 == '--public-key' && $3 == '--enrollment-token-file' ]] || usage
 public_key=$2
-enrollment_token=$4
+enrollment_token_file=$4
 [[ ${public_key} != *$'\n'* && ${public_key} != *$'\r'* ]] || fail 'public key must be exactly one line'
+[[ -f ${enrollment_token_file} && ! -L ${enrollment_token_file} ]] || fail 'unsafe enrollment token file'
+token_file_metadata=$(stat -c '%u:%a:%F' "$enrollment_token_file")
+token_file_owner=${token_file_metadata%%:*}
+token_file_rest=${token_file_metadata#*:}
+[[ ${token_file_rest} == '600:regular file' ]] || fail 'unsafe enrollment token file metadata'
+[[ ${token_file_owner} == 0 || ${token_file_owner} == "${SUDO_UID:-0}" ]] || fail 'unexpected enrollment token file owner'
+mapfile -t enrollment_token_lines <"$enrollment_token_file"
+[[ ${#enrollment_token_lines[@]} -eq 1 ]] || fail 'invalid enrollment token file'
+enrollment_token=${enrollment_token_lines[0]}
 [[ ${enrollment_token} =~ ^vg1_[A-Za-z0-9_-]{43}$ ]] || fail 'invalid enrollment token'
 
 for command in adduser userdel install stat visudo bash sudo ssh-keygen getent id mktemp wc rm; do
@@ -313,7 +322,9 @@ visudo -cf "$tmpdir/vds-guardian.sudoers"
 
 created_guardian=1
 adduser --disabled-password --gecos '' guardian
-for group in $(id -nG guardian); do
+guardian_groups=$(id -nG guardian) || fail 'cannot determine guardian groups'
+[[ -n ${guardian_groups} ]] || fail 'guardian group list is empty'
+for group in $guardian_groups; do
   case "$group" in
     guardian|users) ;;
     *)
