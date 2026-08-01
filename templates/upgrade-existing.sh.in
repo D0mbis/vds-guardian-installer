@@ -1,0 +1,231 @@
+#!/bin/bash
+set -Eeuo pipefail
+PATH='/usr/sbin:/usr/bin:/sbin:/bin'
+umask 077
+export LC_ALL=C
+
+readonly HELPER_PATH='/usr/local/sbin/vds-guardianctl'
+readonly SUDOERS_PATH='/etc/sudoers.d/vds-guardian'
+readonly LOCK_PATH='/run/vds-guardian-upgrade.lock'
+readonly BASELINE_HELPER_SHA256='4a1d6c53954b5b88f5a7c01821377142f1e998dc37ac388a4e74d40729282e08'
+readonly BASELINE_SUDOERS_SHA256='125a74e6ffa5c50d3fecf8142cc7c5a1de3017e455a1c91f87e6f298c8309020'
+readonly NEW_HELPER_SHA256='__NEW_HELPER_SHA256__'
+readonly NEW_SUDOERS_SHA256='__NEW_SUDOERS_SHA256__'
+
+fail() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+[[ ${EUID} -eq 0 ]] || fail 'run this upgrade as root (for example: sudo bash upgrade-existing.sh)'
+[[ $# -eq 0 ]] || fail 'this upgrade accepts no arguments'
+
+for command in bash cat cmp flock getent id install mktemp mv rm sha256sum stat visudo; do
+  command -v "$command" >/dev/null 2>&1 || fail "required command is missing: $command"
+done
+
+safe_dir() {
+  local path=$1 metadata uid gid mode type mode_number
+  [[ -d ${path} && ! -L ${path} ]] || return 1
+  metadata=$(stat -c '%u:%g:%a:%F' -- "$path") || return 1
+  IFS=: read -r uid gid mode type <<<"$metadata"
+  [[ $uid == 0 && $gid == 0 && $type == directory ]] || return 1
+  mode_number=$((8#$mode))
+  (( (mode_number & 0022) == 0 ))
+}
+
+require_safe_dir() {
+  safe_dir "$1" || fail "required parent is not a real root:root non-group/world-writable directory: $1"
+}
+
+safe_file() {
+  local path=$1 expected_mode=$2 metadata
+  [[ -f ${path} && ! -L ${path} ]] || return 1
+  metadata=$(stat -c '%u:%g:%a:%F' -- "$path") || return 1
+  [[ ${metadata} == "0:0:${expected_mode}:regular file" ]]
+}
+
+require_safe_file() {
+  safe_file "$1" "$2" || fail "unsafe owner, mode, or type for required path: $1"
+}
+
+file_sha256() {
+  local output
+  output=$(sha256sum -- "$1") || fail "cannot hash file: $1"
+  printf '%s\n' "${output%% *}"
+}
+
+require_all_parents() {
+  local parent
+  for parent in / /usr /usr/local /usr/local/sbin /etc /etc/sudoers.d; do
+    require_safe_dir "$parent"
+  done
+}
+
+require_installed_state() {
+  local expected_helper=$1 expected_sudoers=$2
+  require_all_parents
+  require_safe_file "$HELPER_PATH" 755
+  require_safe_file "$SUDOERS_PATH" 440
+  [[ $(file_sha256 "$HELPER_PATH") == "$expected_helper" ]] || fail 'installed helper hash changed'
+  [[ $(file_sha256 "$SUDOERS_PATH") == "$expected_sudoers" ]] || fail 'installed sudoers hash changed'
+}
+
+# Validate the lock boundary before opening. / and /run are root-only writable,
+# so an unprivileged process cannot race this check by replacing the fixed lock
+# leaf or its path components.
+require_safe_dir /
+require_safe_dir /run
+[[ ! -L $LOCK_PATH ]] || fail "upgrade lock must not be a symlink: $LOCK_PATH"
+exec {lock_fd}>>"$LOCK_PATH" || fail "cannot open upgrade lock: $LOCK_PATH"
+require_safe_dir /run
+[[ -f $LOCK_PATH && ! -L $LOCK_PATH ]] || fail "upgrade lock is not a regular non-symlink file: $LOCK_PATH"
+lock_metadata=$(stat -c '%u:%g:%a' -- "$LOCK_PATH") || fail 'cannot inspect upgrade lock'
+IFS=: read -r lock_uid lock_gid lock_mode <<<"$lock_metadata"
+lock_mode_number=$((8#$lock_mode))
+[[ $lock_uid == 0 && $lock_gid == 0 ]] \
+  || fail 'upgrade lock has unsafe owner'
+(( (lock_mode_number & 0022) == 0 )) || fail 'upgrade lock is group/world writable'
+flock -n "$lock_fd" || fail 'another guardian upgrade is already running'
+
+# Nothing below inspects or hashes either target until this process owns the
+# exclusive lock. The descriptor remains open through EXIT cleanup.
+require_all_parents
+require_safe_file "$HELPER_PATH" 755
+require_safe_file "$SUDOERS_PATH" 440
+current_helper_sha256=$(file_sha256 "$HELPER_PATH")
+current_sudoers_sha256=$(file_sha256 "$SUDOERS_PATH")
+
+getent passwd guardian >/dev/null || fail 'guardian account does not exist'
+guardian_uid=$(id -u guardian) || fail 'cannot determine guardian uid'
+[[ $guardian_uid != 0 ]] || fail 'guardian must not have uid 0'
+guardian_primary_gid=$(id -g guardian) || fail 'cannot determine guardian primary gid'
+[[ $guardian_primary_gid != 0 ]] || fail 'guardian must not have primary gid 0'
+guardian_numeric_groups=$(id -G guardian) || fail 'cannot determine guardian numeric groups'
+for group_id in $guardian_numeric_groups; do
+  [[ $group_id != 0 ]] || fail 'guardian must not belong to numeric group 0'
+done
+guardian_groups=$(id -nG guardian) || fail 'cannot determine guardian groups'
+[[ -n ${guardian_groups} ]] || fail 'guardian group list is empty'
+for group in $guardian_groups; do
+  case "$group" in
+    guardian|users) ;;
+    *) fail "guardian has an unexpected supplemental group: $group" ;;
+  esac
+done
+
+tmpdir=$(mktemp -d)
+mutation_started=0
+committed=0
+rollback_done=0
+
+atomic_replace() {
+  local source=$1 destination=$2 mode=$3 parent stage
+  parent=${destination%/*}
+  safe_dir "$parent" || return 1
+  stage=$(mktemp "$parent/.vds-guardian-upgrade.XXXXXX") || return 1
+  if ! install -m "$mode" -o root -g root -- "$source" "$stage"; then
+    rm -f -- "$stage"
+    return 1
+  fi
+  if ! safe_file "$stage" "${mode#0}"; then
+    rm -f -- "$stage"
+    return 1
+  fi
+  safe_dir "$parent" || { rm -f -- "$stage"; return 1; }
+  mv -T -- "$stage" "$destination" || { rm -f -- "$stage"; return 1; }
+}
+
+rollback_and_verify() {
+  local failed=0
+  rollback_done=1
+  printf '%s\n' 'ERROR: upgrade failed; restoring both original files' >&2
+  atomic_replace "$tmpdir/original-helper" "$HELPER_PATH" 0755 \
+    || { printf '%s\n' 'CRITICAL: failed to restore original helper' >&2; failed=1; }
+  atomic_replace "$tmpdir/original-sudoers" "$SUDOERS_PATH" 0440 \
+    || { printf '%s\n' 'CRITICAL: failed to restore original sudoers file' >&2; failed=1; }
+
+  if ! safe_file "$HELPER_PATH" 755 \
+    || [[ $(sha256sum -- "$HELPER_PATH" 2>/dev/null) != "$BASELINE_HELPER_SHA256  $HELPER_PATH" ]] \
+    || ! bash -n "$HELPER_PATH"; then
+    printf '%s\n' 'CRITICAL: restored helper failed metadata, hash, or syntax verification' >&2
+    failed=1
+  fi
+  if ! safe_file "$SUDOERS_PATH" 440 \
+    || [[ $(sha256sum -- "$SUDOERS_PATH" 2>/dev/null) != "$BASELINE_SUDOERS_SHA256  $SUDOERS_PATH" ]] \
+    || ! visudo -cf "$SUDOERS_PATH"; then
+    printf '%s\n' 'CRITICAL: restored sudoers failed metadata, hash, or visudo verification' >&2
+    failed=1
+  fi
+  return "$failed"
+}
+
+cleanup() {
+  local status=$? rollback_status=0
+  trap - EXIT INT TERM HUP
+  if [[ ${mutation_started} -eq 1 && ${committed} -eq 0 && ${rollback_done} -eq 0 ]]; then
+    rollback_and_verify || rollback_status=$?
+  fi
+  rm -rf -- "$tmpdir" || { printf '%s\n' 'CRITICAL: failed to remove upgrade temporary directory' >&2; rollback_status=1; }
+  if (( status == 0 && rollback_status != 0 )); then
+    status=1
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+cat >"$tmpdir/new-helper" <<'VDS_GUARDIAN_HELPER'
+__HELPER__
+VDS_GUARDIAN_HELPER
+
+cat >"$tmpdir/new-sudoers" <<'VDS_GUARDIAN_SUDOERS'
+__SUDOERS__
+VDS_GUARDIAN_SUDOERS
+
+[[ $(file_sha256 "$tmpdir/new-helper") == "$NEW_HELPER_SHA256" ]] || fail 'embedded helper hash does not match the reviewed build'
+[[ $(file_sha256 "$tmpdir/new-sudoers") == "$NEW_SUDOERS_SHA256" ]] || fail 'embedded sudoers hash does not match the reviewed build'
+bash -n "$tmpdir/new-helper"
+visudo -cf "$tmpdir/new-sudoers"
+
+if [[ ${current_helper_sha256} == "$NEW_HELPER_SHA256" && ${current_sudoers_sha256} == "$NEW_SUDOERS_SHA256" ]]; then
+  require_installed_state "$NEW_HELPER_SHA256" "$NEW_SUDOERS_SHA256"
+  bash -n "$HELPER_PATH"
+  visudo -cf "$SUDOERS_PATH"
+  cmp -s "$tmpdir/new-helper" "$HELPER_PATH" || fail 'installed helper is not the exact reviewed new file'
+  cmp -s "$tmpdir/new-sudoers" "$SUDOERS_PATH" || fail 'installed sudoers is not the exact reviewed new file'
+  printf '%s\n' 'READY: guardian helper and sudoers are already at the reviewed current version'
+  committed=1
+  exit 0
+fi
+
+[[ ${current_helper_sha256} == "$BASELINE_HELPER_SHA256" ]] \
+  || fail 'installed helper does not match the exact supported baseline; no changes made'
+[[ ${current_sudoers_sha256} == "$BASELINE_SUDOERS_SHA256" ]] \
+  || fail 'installed sudoers does not match the exact supported baseline; no changes made'
+
+# Repeat the complete boundary, leaf metadata, and baseline hash checks directly
+# before backup, then prove both private backup copies match that baseline.
+require_installed_state "$BASELINE_HELPER_SHA256" "$BASELINE_SUDOERS_SHA256"
+install -m 600 -o root -g root -- "$HELPER_PATH" "$tmpdir/original-helper"
+install -m 600 -o root -g root -- "$SUDOERS_PATH" "$tmpdir/original-sudoers"
+[[ $(file_sha256 "$tmpdir/original-helper") == "$BASELINE_HELPER_SHA256" ]] || fail 'helper changed while preparing backup'
+[[ $(file_sha256 "$tmpdir/original-sudoers") == "$BASELINE_SUDOERS_SHA256" ]] || fail 'sudoers changed while preparing backup'
+
+# Repeat once more immediately before installation. Replacement is staged in
+# each verified destination directory and mv -T replaces the leaf itself.
+require_installed_state "$BASELINE_HELPER_SHA256" "$BASELINE_SUDOERS_SHA256"
+mutation_started=1
+atomic_replace "$tmpdir/new-helper" "$HELPER_PATH" 0755
+atomic_replace "$tmpdir/new-sudoers" "$SUDOERS_PATH" 0440
+
+require_installed_state "$NEW_HELPER_SHA256" "$NEW_SUDOERS_SHA256"
+bash -n "$HELPER_PATH"
+visudo -cf "$SUDOERS_PATH"
+cmp -s "$tmpdir/new-helper" "$HELPER_PATH" || fail 'installed helper is not the exact reviewed new file'
+cmp -s "$tmpdir/new-sudoers" "$SUDOERS_PATH" || fail 'installed sudoers is not the exact reviewed new file'
+
+committed=1
+printf '%s\n' 'READY: guardian helper and sudoers upgraded from the exact supported baseline'

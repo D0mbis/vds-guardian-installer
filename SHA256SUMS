@@ -1,2 +1,3 @@
 6cac36728f8e9baccc0e5eb58b505cb8481e73028acba38fbc69add4fec401a6  dist/install-new.sh
 2eaa0c15147db141421f8370161f7aa0ee681d817fec130061ad9e4a9ed7f5bb  dist/install-existing.sh
+02fb84da005d90078e9839109c6b5a03fdcec067ad58c6ca6dae76d6eaeb8f69  dist/upgrade-existing.sh

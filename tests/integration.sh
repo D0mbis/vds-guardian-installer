@@ -8,8 +8,17 @@ python3 "$ROOT/tools/build.py"
 bash -n "$ROOT/src/vds-guardianctl"
 bash -n "$ROOT/dist/install-new.sh"
 bash -n "$ROOT/dist/install-existing.sh"
+bash -n "$ROOT/dist/upgrade-existing.sh"
 visudo -cf "$ROOT/src/vds-guardian.sudoers"
 (cd "$ROOT" && sha256sum -c SHA256SUMS)
+
+# Fixtures make shallow CI independent of historical Git objects. When the
+# baseline commit is available locally, prove that they are byte-for-byte the
+# source artifacts published at that commit.
+if git -C "$ROOT" cat-file -e 5a78cb9^{commit} 2>/dev/null; then
+  cmp -s <(git -C "$ROOT" show 5a78cb9:src/vds-guardianctl) "$ROOT/tests/fixtures/vds-guardianctl-5a78cb9"
+  cmp -s <(git -C "$ROOT" show 5a78cb9:src/vds-guardian.sudoers) "$ROOT/tests/fixtures/vds-guardian.sudoers-5a78cb9"
+fi
 
 # Inspection templates must select only reviewed metadata and must never dump
 # environment, label maps, config/secret contents, or volume mountpoints.
@@ -98,6 +107,167 @@ printf 'integration_%s_ok\\n' '$mode'
 
 run_container_test new
 run_container_test existing
+
+docker run --rm -v "$ROOT:/repo:ro" "$IMAGE" bash -lc '
+set -Eeuo pipefail
+apt-get update -qq
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sudo >/dev/null
+adduser --disabled-password --gecos "" guardian >/dev/null
+
+baseline_helper=4a1d6c53954b5b88f5a7c01821377142f1e998dc37ac388a4e74d40729282e08
+baseline_sudoers=125a74e6ffa5c50d3fecf8142cc7c5a1de3017e455a1c91f87e6f298c8309020
+new_helper=$(sha256sum /repo/src/vds-guardianctl | cut -d" " -f1)
+new_sudoers=$(sha256sum /repo/src/vds-guardian.sudoers | cut -d" " -f1)
+
+install_baseline() {
+  rm -f /usr/local/sbin/vds-guardianctl /etc/sudoers.d/vds-guardian
+  install -o root -g root -m 0755 /repo/tests/fixtures/vds-guardianctl-5a78cb9 /usr/local/sbin/vds-guardianctl
+  install -o root -g root -m 0440 /repo/tests/fixtures/vds-guardian.sudoers-5a78cb9 /etc/sudoers.d/vds-guardian
+  test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline_helper"
+  test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$baseline_sudoers"
+}
+
+install_baseline
+install -o root -g root -m 0755 /repo/tests/fake-docker /usr/bin/docker
+rm -f /tmp/fake-docker.commands
+
+# A second upgrader fails fast while the known production lock is held and
+# cannot mutate either baseline leaf. Hold the lock on this shell descriptor
+# so releasing it cannot leave an orphaned child process with the lock open.
+exec {test_lock_fd}>/run/vds-guardian-upgrade.lock
+flock -n "$test_lock_fd"
+if bash /repo/dist/upgrade-existing.sh >/tmp/concurrent.log 2>&1; then
+  echo "upgrade ignored the exclusive lock" >&2
+  exit 74
+fi
+grep -Fq "another guardian upgrade is already running" /tmp/concurrent.log || { cat /tmp/concurrent.log >&2; exit 79; }
+test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline_helper"
+test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$baseline_sudoers"
+flock -u "$test_lock_fd"
+exec {test_lock_fd}>&-
+
+# Unsafe parent metadata and symlink leaves reject before mutation.
+chmod 0775 /usr/local/sbin
+if bash /repo/dist/upgrade-existing.sh >/tmp/unsafe-parent.log 2>&1; then
+  echo "upgrade accepted a group-writable parent" >&2
+  exit 75
+fi
+test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline_helper"
+test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$baseline_sudoers"
+chmod 0755 /usr/local/sbin
+
+root_mode=$(stat -c "%a" /)
+chmod 0775 /
+if bash /repo/dist/upgrade-existing.sh >/tmp/unsafe-root.log 2>&1; then
+  echo "upgrade accepted a group-writable root directory" >&2
+  exit 80
+fi
+test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline_helper"
+test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$baseline_sudoers"
+chmod "$root_mode" /
+
+mv /usr/local/sbin/vds-guardianctl /tmp/baseline-helper
+ln -s /tmp/baseline-helper /usr/local/sbin/vds-guardianctl
+if bash /repo/dist/upgrade-existing.sh >/tmp/symlink-leaf.log 2>&1; then
+  echo "upgrade accepted a symlink helper leaf" >&2
+  exit 76
+fi
+test "$(sha256sum /tmp/baseline-helper | cut -d" " -f1)" = "$baseline_helper"
+rm /usr/local/sbin/vds-guardianctl
+mv /tmp/baseline-helper /usr/local/sbin/vds-guardianctl
+
+# Numeric group zero is forbidden independently of the named allowlist.
+usermod -g 0 guardian
+if bash /repo/dist/upgrade-existing.sh >/tmp/root-gid.log 2>&1; then
+  echo "upgrade accepted guardian primary gid 0" >&2
+  exit 77
+fi
+test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline_helper"
+test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$baseline_sudoers"
+usermod -g guardian guardian
+
+bash /repo/dist/upgrade-existing.sh >/tmp/upgrade.log
+cmp -s /repo/src/vds-guardianctl /usr/local/sbin/vds-guardianctl
+cmp -s /repo/src/vds-guardian.sudoers /etc/sudoers.d/vds-guardian
+test "$(stat -c "%U:%G %a" /usr/local/sbin/vds-guardianctl)" = "root:root 755"
+test "$(stat -c "%U:%G %a" /etc/sudoers.d/vds-guardian)" = "root:root 440"
+test ! -e /tmp/fake-docker.commands
+
+# Exact-current reruns are successful and do not mutate the installed files.
+bash /repo/dist/upgrade-existing.sh >/tmp/upgrade-idempotent.log
+test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$new_helper"
+test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$new_sudoers"
+
+# Either member drifting from the exact baseline rejects the whole upgrade.
+install_baseline
+printf "# drift\n" >>/usr/local/sbin/vds-guardianctl
+drifted_helper=$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)
+if bash /repo/dist/upgrade-existing.sh >/tmp/drift-helper.log 2>&1; then
+  echo "upgrade accepted drifted helper" >&2
+  exit 71
+fi
+test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$drifted_helper"
+test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$baseline_sudoers"
+
+install_baseline
+printf "# drift\n" >>/etc/sudoers.d/vds-guardian
+drifted_sudoers=$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)
+if bash /repo/dist/upgrade-existing.sh >/tmp/drift-sudoers.log 2>&1; then
+  echo "upgrade accepted drifted sudoers" >&2
+  exit 72
+fi
+test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline_helper"
+test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$drifted_sudoers"
+
+# Force the post-install visudo check to fail after both files were installed.
+# The ERR rollback must restore both baseline files, including exact modes.
+install_baseline
+mv /usr/sbin/visudo /usr/sbin/visudo.real
+printf "%s\n" \
+  "#!/bin/bash" \
+  "count=0" \
+  "[[ -f /tmp/visudo-count ]] && read -r count </tmp/visudo-count" \
+  "count=\$((count + 1))" \
+  "printf \"%s\\n\" \"\$count\" >/tmp/visudo-count" \
+  "[[ \$count -ne 2 ]] || exit 99" \
+  "exec /usr/sbin/visudo.real \"\$@\"" >/usr/sbin/visudo
+chmod 0755 /usr/sbin/visudo
+if bash /repo/dist/upgrade-existing.sh >/tmp/late-failure.log 2>&1; then
+  echo "upgrade unexpectedly survived artificial late failure" >&2
+  exit 73
+fi
+test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline_helper"
+test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$baseline_sudoers"
+test "$(stat -c "%U:%G %a" /usr/local/sbin/vds-guardianctl)" = "root:root 755"
+test "$(stat -c "%U:%G %a" /etc/sudoers.d/vds-guardian)" = "root:root 440"
+/usr/sbin/visudo.real -cf /etc/sudoers.d/vds-guardian >/dev/null
+test "$(cat /tmp/visudo-count)" = 3
+! grep -Fq CRITICAL /tmp/late-failure.log
+
+# If rollback validation itself fails, restoration is still attempted for both
+# leaves, the result remains non-zero, and operators receive a machine-greppable
+# CRITICAL diagnostic. Calls: embedded=1, post-install=2, rollback=3.
+install_baseline
+printf "%s\n" \
+  "#!/bin/bash" \
+  "count=0" \
+  "[[ -f /tmp/visudo-count-critical ]] && read -r count </tmp/visudo-count-critical" \
+  "count=\$((count + 1))" \
+  "printf \"%s\\n\" \"\$count\" >/tmp/visudo-count-critical" \
+  "[[ \$count -lt 2 ]] || exit 98" \
+  "exec /usr/sbin/visudo.real \"\$@\"" >/usr/sbin/visudo
+chmod 0755 /usr/sbin/visudo
+if bash /repo/dist/upgrade-existing.sh >/tmp/rollback-validation-failure.log 2>&1; then
+  echo "upgrade masked rollback validation failure" >&2
+  exit 78
+fi
+grep -Fq "CRITICAL: restored sudoers failed metadata, hash, or visudo verification" /tmp/rollback-validation-failure.log
+test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline_helper"
+test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$baseline_sudoers"
+test "$(stat -c "%U:%G %a" /usr/local/sbin/vds-guardianctl)" = "root:root 755"
+test "$(stat -c "%U:%G %a" /etc/sudoers.d/vds-guardian)" = "root:root 440"
+printf "%s\n" "upgrade_existing_lock_boundaries_identity_and_verified_rollback_ok"
+'
 
 docker run --rm -v "$ROOT:/repo:ro" "$IMAGE" bash -lc '
 set -Eeuo pipefail
