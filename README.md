@@ -14,6 +14,7 @@ Generic, auditable least-privilege installer for the Hermes `vds-guardian` profi
 
 Read-only:
 
+- `audit-compose-projects` — fail-closed Docker inventory of containers, volumes, networks, and selected Compose metadata; it does not read environment/configuration file contents or volume contents;
 - `audit-storage`
 - `audit-services`
 - `audit-security`

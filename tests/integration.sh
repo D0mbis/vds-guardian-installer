@@ -11,6 +11,17 @@ bash -n "$ROOT/dist/install-existing.sh"
 visudo -cf "$ROOT/src/vds-guardian.sudoers"
 (cd "$ROOT" && sha256sum -c SHA256SUMS)
 
+# Inspection templates must select only reviewed metadata and must never dump
+# environment, label maps, config/secret contents, or volume mountpoints.
+if grep -En '\{\{[[:space:]]*(json[[:space:]]+)?\.Config\.Env|\{\{[[:space:]]*(json[[:space:]]+)?\.Config\.Labels[[:space:]]*\}\}|\{\{[[:space:]]*(json[[:space:]]+)?\.Labels[[:space:]]*\}\}|\.Configs|\.Secrets|\.Mountpoint' \
+  "$ROOT/src/vds-guardianctl" "$ROOT/dist/install-new.sh" "$ROOT/dist/install-existing.sh"; then
+  echo 'sensitive Docker inspection template found' >&2
+  exit 20
+fi
+grep -Fq 'compose_project={{printf "%q" (index .Labels "com.docker.compose.project")}} compose_volume={{printf "%q" (index .Labels "com.docker.compose.volume")}} compose_version={{printf "%q" (index .Labels "com.docker.compose.version")}}' "$ROOT/src/vds-guardianctl"
+grep -Fq 'compose_project={{printf "%q" (index .Labels "com.docker.compose.project")}} compose_network={{printf "%q" (index .Labels "com.docker.compose.network")}} compose_version={{printf "%q" (index .Labels "com.docker.compose.version")}}' "$ROOT/src/vds-guardianctl"
+grep -Fq 'name={{printf "%q" .Name}} source={{printf "%q" .Source}}' "$ROOT/src/vds-guardianctl"
+
 run_container_test() {
   local mode=$1
   docker run --rm -v "$ROOT:/repo:ro" "$IMAGE" bash -lc "
@@ -33,7 +44,36 @@ else
 fi
 id guardian
 stat -c '%U:%G %a %n' /usr/local/sbin/vds-guardianctl /etc/sudoers.d/vds-guardian
+install -o root -g root -m 0755 /repo/tests/fake-docker /usr/bin/docker
+rm -f /tmp/fake-docker.commands
+sudo -u guardian sudo -n /usr/local/sbin/vds-guardianctl audit-compose-projects >/tmp/compose-audit.log
+grep -Fx 'id=\"container-id\" name=\"sample-container\" image=\"sample-image\" state=\"running\" status=\"Up 1 minute\"' /tmp/compose-audit.log
+grep -Fx 'id=\"container-id\" name=\"/sample-container\" image=\"sample-image\" state=\"running\" restart_policy=\"unless-stopped\"' /tmp/compose-audit.log
+grep -Fx 'compose_project=\"sample-project\nforged=true\" compose_service=\"sample-service\" compose_working_dir=\"/srv/sample\" compose_config_files=\"/srv/sample/compose.yml\" compose_oneoff=\"False\" compose_version=\"2.0.0\"' /tmp/compose-audit.log
+grep -Fx 'mount type=\"volume\" name=\"sample-volume\" source=\"/var/lib/docker/volumes/sample-volume/_data\" destination=\"/data\" rw=true' /tmp/compose-audit.log
+grep -Fx 'network name=\"sample-network\" id=\"network-id\"' /tmp/compose-audit.log
+grep -Fx 'id=\"sample-volume\" name=\"sample-volume\" driver=\"local\" scope=\"local\" internal=n/a' /tmp/compose-audit.log
+grep -Fx 'compose_project=\"sample-project\" compose_volume=\"data\" compose_version=\"2.0.0\"' /tmp/compose-audit.log
+grep -Fx 'id=\"network-id\" name=\"sample-network\" driver=\"bridge\" scope=\"local\" internal=false' /tmp/compose-audit.log
+grep -Fx 'compose_project=\"sample-project\" compose_network=\"default\" compose_version=\"2.0.0\"' /tmp/compose-audit.log
+! grep -F 'compose_project=\"sample-project' /tmp/compose-audit.log | grep -F 'forged=true' | grep -Fvx 'compose_project=\"sample-project\nforged=true\" compose_service=\"sample-service\" compose_working_dir=\"/srv/sample\" compose_config_files=\"/srv/sample/compose.yml\" compose_oneoff=\"False\" compose_version=\"2.0.0\"'
+if grep -E '(^| )(stop|rm|prune|update|restart)( |$)|compose( |.* )down( |$)' /tmp/fake-docker.commands; then
+  echo 'mutation docker subcommand used by audit' >&2
+  exit 30
+fi
+expected_rule='Cmnd_Alias VDS_GUARDIAN_AUDIT = /usr/local/sbin/vds-guardianctl audit-compose-projects, /usr/local/sbin/vds-guardianctl audit-storage, /usr/local/sbin/vds-guardianctl audit-services, /usr/local/sbin/vds-guardianctl audit-security, /usr/local/sbin/vds-guardianctl verify-health'
+test \"\$(grep '^Cmnd_Alias VDS_GUARDIAN_AUDIT = ' /etc/sudoers.d/vds-guardian)\" = \"\$expected_rule\"
+touch /tmp/fake-docker.fail
+if sudo -u guardian sudo -n /usr/local/sbin/vds-guardianctl audit-compose-projects >/dev/null 2>&1; then
+  echo 'audit-compose-projects did not fail closed on inventory error' >&2
+  exit 36
+fi
+rm /tmp/fake-docker.fail
 sudo -u guardian sudo -n /usr/local/sbin/vds-guardianctl verify-health >/tmp/verify.log
+if sudo -u guardian sudo -n /usr/local/sbin/vds-guardianctl audit-compose-projects extra >/dev/null 2>&1; then
+  echo 'audit-compose-projects extra argument unexpectedly accepted' >&2
+  exit 35
+fi
 if sudo -u guardian sudo -n /usr/local/sbin/vds-guardianctl verify-health extra >/dev/null 2>&1; then
   echo 'extra argument unexpectedly accepted' >&2
   exit 31

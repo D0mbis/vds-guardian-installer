@@ -91,6 +91,49 @@ show_docker_inventory() {
   docker system df
 }
 
+audit_compose_projects() {
+  have docker || fail 'docker is not installed'
+  docker info >/dev/null 2>&1 || fail 'docker daemon is unavailable'
+
+  local ids id
+  section 'docker containers'
+  docker ps -a --no-trunc --format 'id={{printf "%q" .ID}} name={{printf "%q" .Names}} image={{printf "%q" .Image}} state={{printf "%q" .State}} status={{printf "%q" .Status}}' \
+    || fail 'could not list docker containers'
+  ids=$(docker ps -aq --no-trunc) || fail 'could not collect docker container IDs'
+  if [[ -n ${ids} ]]; then
+    while IFS= read -r id; do
+      [[ -n ${id} ]] || continue
+      docker inspect --type container --format 'id={{printf "%q" .Id}} name={{printf "%q" .Name}} image={{printf "%q" .Config.Image}} state={{printf "%q" .State.Status}} restart_policy={{printf "%q" .HostConfig.RestartPolicy.Name}}
+compose_project={{printf "%q" (index .Config.Labels "com.docker.compose.project")}} compose_service={{printf "%q" (index .Config.Labels "com.docker.compose.service")}} compose_working_dir={{printf "%q" (index .Config.Labels "com.docker.compose.project.working_dir")}} compose_config_files={{printf "%q" (index .Config.Labels "com.docker.compose.project.config_files")}} compose_oneoff={{printf "%q" (index .Config.Labels "com.docker.compose.oneoff")}} compose_version={{printf "%q" (index .Config.Labels "com.docker.compose.version")}}
+{{range .Mounts}}mount type={{printf "%q" .Type}} name={{printf "%q" .Name}} source={{printf "%q" .Source}} destination={{printf "%q" .Destination}} rw={{.RW}}
+{{end}}{{range $name, $network := .NetworkSettings.Networks}}network name={{printf "%q" $name}} id={{printf "%q" $network.NetworkID}}
+{{end}}' "${id}" || fail "could not inspect docker container ${id}"
+    done <<<"${ids}"
+  fi
+
+  section 'docker volumes'
+  ids=$(docker volume ls -q) || fail 'could not list docker volumes'
+  if [[ -n ${ids} ]]; then
+    while IFS= read -r id; do
+      [[ -n ${id} ]] || continue
+      docker volume inspect --format 'id={{printf "%q" .Name}} name={{printf "%q" .Name}} driver={{printf "%q" .Driver}} scope={{printf "%q" .Scope}} internal=n/a
+compose_project={{printf "%q" (index .Labels "com.docker.compose.project")}} compose_volume={{printf "%q" (index .Labels "com.docker.compose.volume")}} compose_version={{printf "%q" (index .Labels "com.docker.compose.version")}}' "${id}" \
+        || fail "could not inspect docker volume ${id}"
+    done <<<"${ids}"
+  fi
+
+  section 'docker networks'
+  ids=$(docker network ls -q --no-trunc) || fail 'could not list docker networks'
+  if [[ -n ${ids} ]]; then
+    while IFS= read -r id; do
+      [[ -n ${id} ]] || continue
+      docker network inspect --format 'id={{printf "%q" .Id}} name={{printf "%q" .Name}} driver={{printf "%q" .Driver}} scope={{printf "%q" .Scope}} internal={{.Internal}}
+compose_project={{printf "%q" (index .Labels "com.docker.compose.project")}} compose_network={{printf "%q" (index .Labels "com.docker.compose.network")}} compose_version={{printf "%q" (index .Labels "com.docker.compose.version")}}' "${id}" \
+        || fail "could not inspect docker network ${id}"
+    done <<<"${ids}"
+  fi
+}
+
 audit_storage() {
   section 'identity'
   hostname --fqdn 2>/dev/null || hostname
@@ -268,6 +311,7 @@ clean_docker_build_cache_30d() {
 require_root_and_integrity "$@"
 
 case "$1" in
+  audit-compose-projects) audit_compose_projects ;;
   audit-storage) audit_storage ;;
   audit-services) audit_services ;;
   audit-security) audit_security ;;
@@ -283,7 +327,7 @@ VDS_GUARDIAN_HELPER
 cat >"$tmpdir/vds-guardian.sudoers" <<'VDS_GUARDIAN_SUDOERS'
 # Managed capability boundary for the vds-guardian Hermes profile.
 # Every allowed command has fixed arguments; no wildcard or arbitrary path is permitted.
-Cmnd_Alias VDS_GUARDIAN_AUDIT = /usr/local/sbin/vds-guardianctl audit-storage, /usr/local/sbin/vds-guardianctl audit-services, /usr/local/sbin/vds-guardianctl audit-security, /usr/local/sbin/vds-guardianctl verify-health
+Cmnd_Alias VDS_GUARDIAN_AUDIT = /usr/local/sbin/vds-guardianctl audit-compose-projects, /usr/local/sbin/vds-guardianctl audit-storage, /usr/local/sbin/vds-guardianctl audit-services, /usr/local/sbin/vds-guardianctl audit-security, /usr/local/sbin/vds-guardianctl verify-health
 Cmnd_Alias VDS_GUARDIAN_CLEAN = /usr/local/sbin/vds-guardianctl clean-apt-cache, /usr/local/sbin/vds-guardianctl vacuum-journal-30d, /usr/local/sbin/vds-guardianctl clean-tmpfiles, /usr/local/sbin/vds-guardianctl clean-docker-build-cache-30d
 guardian ALL=(root) NOPASSWD: VDS_GUARDIAN_AUDIT, VDS_GUARDIAN_CLEAN
 VDS_GUARDIAN_SUDOERS

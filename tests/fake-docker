@@ -1,0 +1,122 @@
+#!/bin/bash
+set -Eeuo pipefail
+
+printf '%q ' "$@" >>/tmp/fake-docker.commands
+printf '\n' >>/tmp/fake-docker.commands
+
+fail_unexpected() {
+  printf 'unexpected fake docker command:' >&2
+  printf ' %q' "$@" >&2
+  printf '\n' >&2
+  exit 90
+}
+
+check_safe_format() {
+  local format=$1
+  [[ ${format} != *'.Config.Env'* ]] || fail_unexpected "$@"
+  [[ ${format} != *'.Configs'* ]] || fail_unexpected "$@"
+  [[ ${format} != *'.Secrets'* ]] || fail_unexpected "$@"
+  [[ ${format} != *'.Mountpoint'* ]] || fail_unexpected "$@"
+  [[ ! ${format} =~ \{\{[[:space:]]*(json[[:space:]]+)?\.Config\.Labels[[:space:]]*\}\} ]] || fail_unexpected "$@"
+  [[ ! ${format} =~ \{\{[[:space:]]*(json[[:space:]]+)?\.Labels[[:space:]]*\}\} ]] || fail_unexpected "$@"
+}
+
+require_format_fields() {
+  local format=$1 required
+  shift
+  for required in "$@"; do
+    [[ ${format} == *"${required}"* ]] || fail_unexpected "missing-format-field=${required}"
+  done
+}
+
+readonly ps_format='id={{printf "%q" .ID}} name={{printf "%q" .Names}} image={{printf "%q" .Image}} state={{printf "%q" .State}} status={{printf "%q" .Status}}'
+readonly inventory_ps_format='container={{.Names}} image={{.Image}} status={{.Status}} ports={{.Ports}}'
+readonly container_format='id={{printf "%q" .Id}} name={{printf "%q" .Name}} image={{printf "%q" .Config.Image}} state={{printf "%q" .State.Status}} restart_policy={{printf "%q" .HostConfig.RestartPolicy.Name}}
+compose_project={{printf "%q" (index .Config.Labels "com.docker.compose.project")}} compose_service={{printf "%q" (index .Config.Labels "com.docker.compose.service")}} compose_working_dir={{printf "%q" (index .Config.Labels "com.docker.compose.project.working_dir")}} compose_config_files={{printf "%q" (index .Config.Labels "com.docker.compose.project.config_files")}} compose_oneoff={{printf "%q" (index .Config.Labels "com.docker.compose.oneoff")}} compose_version={{printf "%q" (index .Config.Labels "com.docker.compose.version")}}
+{{range .Mounts}}mount type={{printf "%q" .Type}} name={{printf "%q" .Name}} source={{printf "%q" .Source}} destination={{printf "%q" .Destination}} rw={{.RW}}
+{{end}}{{range $name, $network := .NetworkSettings.Networks}}network name={{printf "%q" $name}} id={{printf "%q" $network.NetworkID}}
+{{end}}'
+readonly volume_format='id={{printf "%q" .Name}} name={{printf "%q" .Name}} driver={{printf "%q" .Driver}} scope={{printf "%q" .Scope}} internal=n/a
+compose_project={{printf "%q" (index .Labels "com.docker.compose.project")}} compose_volume={{printf "%q" (index .Labels "com.docker.compose.volume")}} compose_version={{printf "%q" (index .Labels "com.docker.compose.version")}}'
+readonly network_format='id={{printf "%q" .Id}} name={{printf "%q" .Name}} driver={{printf "%q" .Driver}} scope={{printf "%q" .Scope}} internal={{.Internal}}
+compose_project={{printf "%q" (index .Labels "com.docker.compose.project")}} compose_network={{printf "%q" (index .Labels "com.docker.compose.network")}} compose_version={{printf "%q" (index .Labels "com.docker.compose.version")}}'
+
+if (( $# == 1 )) && [[ $1 == info ]]; then
+  exit 0
+fi
+
+if (( $# == 5 )) && [[ $1 == ps && $2 == -a && $3 == --no-trunc && $4 == --format ]]; then
+  check_safe_format "$5"
+  if [[ $5 == "$inventory_ps_format" ]]; then
+    require_format_fields "$5" '.Names' '.Image' '.Status' '.Ports'
+    printf '%s\n' 'container=sample-container image=sample-image status=Up ports=127.0.0.1:8080->80/tcp'
+    exit 0
+  fi
+  require_format_fields "$5" '.ID' '.Names' '.Image' '.State' '.Status' 'printf "%q"'
+  [[ $5 == "$ps_format" ]] || fail_unexpected "$@"
+  printf '%s\n' 'id="container-id" name="sample-container" image="sample-image" state="running" status="Up 1 minute"'
+  exit 0
+fi
+
+if (( $# == 2 )) && [[ $1 == system && $2 == df ]]; then
+  printf '%s\n' 'TYPE TOTAL ACTIVE SIZE RECLAIMABLE'
+  exit 0
+fi
+
+if (( $# == 3 )) && [[ $1 == ps && $2 == -aq && $3 == --no-trunc ]]; then
+  printf '%s\n' 'container-id'
+  exit 0
+fi
+
+if (( $# == 6 )) && [[ $1 == inspect && $2 == --type && $3 == container && $4 == --format && $6 == container-id ]]; then
+  check_safe_format "$5"
+  require_format_fields "$5" '.Id' '.Name' '.Config.Image' '.State.Status' '.HostConfig.RestartPolicy.Name' \
+    'index .Config.Labels "com.docker.compose.project"' 'index .Config.Labels "com.docker.compose.service"' \
+    'index .Config.Labels "com.docker.compose.project.working_dir"' 'index .Config.Labels "com.docker.compose.project.config_files"' \
+    'index .Config.Labels "com.docker.compose.oneoff"' 'index .Config.Labels "com.docker.compose.version"' \
+    'range .Mounts' '.Type' '.Name' '.Source' '.Destination' '.RW' '.NetworkSettings.Networks' 'printf "%q"'
+  [[ $5 == "$container_format" ]] || fail_unexpected "$@"
+  printf '%s\n' \
+    'id="container-id" name="/sample-container" image="sample-image" state="running" restart_policy="unless-stopped"' \
+    'compose_project="sample-project\nforged=true" compose_service="sample-service" compose_working_dir="/srv/sample" compose_config_files="/srv/sample/compose.yml" compose_oneoff="False" compose_version="2.0.0"' \
+    'mount type="volume" name="sample-volume" source="/var/lib/docker/volumes/sample-volume/_data" destination="/data" rw=true' \
+    'network name="sample-network" id="network-id"'
+  exit 0
+fi
+
+if (( $# == 3 )) && [[ $1 == volume && $2 == ls && $3 == -q ]]; then
+  printf '%s\n' 'sample-volume'
+  exit 0
+fi
+
+if (( $# == 5 )) && [[ $1 == volume && $2 == inspect && $3 == --format && $5 == sample-volume ]]; then
+  check_safe_format "$4"
+  require_format_fields "$4" '.Name' '.Driver' '.Scope' \
+    'index .Labels "com.docker.compose.project"' 'index .Labels "com.docker.compose.volume"' \
+    'index .Labels "com.docker.compose.version"' 'printf "%q"'
+  [[ $4 == "$volume_format" ]] || fail_unexpected "$@"
+  [[ ! -e /tmp/fake-docker.fail ]] || exit 89
+  printf '%s\n' \
+    'id="sample-volume" name="sample-volume" driver="local" scope="local" internal=n/a' \
+    'compose_project="sample-project" compose_volume="data" compose_version="2.0.0"'
+  exit 0
+fi
+
+if (( $# == 4 )) && [[ $1 == network && $2 == ls && $3 == -q && $4 == --no-trunc ]]; then
+  printf '%s\n' 'network-id'
+  exit 0
+fi
+
+if (( $# == 5 )) && [[ $1 == network && $2 == inspect && $3 == --format && $5 == network-id ]]; then
+  check_safe_format "$4"
+  require_format_fields "$4" '.Id' '.Name' '.Driver' '.Scope' '.Internal' \
+    'index .Labels "com.docker.compose.project"' 'index .Labels "com.docker.compose.network"' \
+    'index .Labels "com.docker.compose.version"' 'printf "%q"'
+  [[ $4 == "$network_format" ]] || fail_unexpected "$@"
+  printf '%s\n' \
+    'id="network-id" name="sample-network" driver="bridge" scope="local" internal=false' \
+    'compose_project="sample-project" compose_network="default" compose_version="2.0.0"'
+  exit 0
+fi
+
+fail_unexpected "$@"
