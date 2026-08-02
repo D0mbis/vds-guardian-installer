@@ -33,7 +33,7 @@ readonly ps_format='id={{printf "%q" .ID}} name={{printf "%q" .Names}} image={{p
 readonly inventory_ps_format='container={{.Names}} image={{.Image}} status={{.Status}} ports={{.Ports}}'
 readonly container_format='id={{printf "%q" .Id}} name={{printf "%q" .Name}} image={{printf "%q" .Config.Image}} state={{printf "%q" .State.Status}} restart_policy={{printf "%q" .HostConfig.RestartPolicy.Name}}
 compose_project={{printf "%q" (index .Config.Labels "com.docker.compose.project")}} compose_service={{printf "%q" (index .Config.Labels "com.docker.compose.service")}} compose_working_dir={{printf "%q" (index .Config.Labels "com.docker.compose.project.working_dir")}} compose_config_files={{printf "%q" (index .Config.Labels "com.docker.compose.project.config_files")}} compose_oneoff={{printf "%q" (index .Config.Labels "com.docker.compose.oneoff")}} compose_version={{printf "%q" (index .Config.Labels "com.docker.compose.version")}}
-{{range .Mounts}}mount type={{printf "%q" .Type}} name={{printf "%q" .Name}} source={{printf "%q" .Source}} destination={{printf "%q" .Destination}} rw={{.RW}}
+{{range .Mounts}}mount type={{printf "%q" .Type}} name={{printf "%q" (or (index . "Name") "")}} source={{printf "%q" .Source}} destination={{printf "%q" .Destination}} rw={{.RW}}
 {{end}}{{range $name, $network := .NetworkSettings.Networks}}network name={{printf "%q" $name}} id={{printf "%q" $network.NetworkID}}
 {{end}}'
 readonly volume_format='id={{printf "%q" .Name}} name={{printf "%q" .Name}} driver={{printf "%q" .Driver}} scope={{printf "%q" .Scope}} internal=n/a
@@ -74,7 +74,8 @@ if (( $# == 6 )) && [[ $1 == inspect && $2 == --type && $3 == container && $4 ==
     'index .Config.Labels "com.docker.compose.project"' 'index .Config.Labels "com.docker.compose.service"' \
     'index .Config.Labels "com.docker.compose.project.working_dir"' 'index .Config.Labels "com.docker.compose.project.config_files"' \
     'index .Config.Labels "com.docker.compose.oneoff"' 'index .Config.Labels "com.docker.compose.version"' \
-    'range .Mounts' '.Type' '.Name' '.Source' '.Destination' '.RW' '.NetworkSettings.Networks' 'printf "%q"'
+    'range .Mounts' '.Type' 'index . "Name"' '.Source' '.Destination' '.RW' '.NetworkSettings.Networks' 'printf "%q"'
+  [[ $5 != *'name={{printf "%q" .Name}} source={{printf "%q" .Source}}'* ]] || fail_unexpected 'unsafe-direct-mount-name-access'
   [[ $5 == "$container_format" ]] || fail_unexpected "$@"
   printf '%s\n' \
     'id="container-id" name="/sample-container" image="sample-image" state="running" restart_policy="unless-stopped"' \

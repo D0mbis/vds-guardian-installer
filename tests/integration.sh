@@ -19,6 +19,10 @@ if git -C "$ROOT" cat-file -e 5a78cb9^{commit} 2>/dev/null; then
   cmp -s <(git -C "$ROOT" show 5a78cb9:src/vds-guardianctl) "$ROOT/tests/fixtures/vds-guardianctl-5a78cb9"
   cmp -s <(git -C "$ROOT" show 5a78cb9:src/vds-guardian.sudoers) "$ROOT/tests/fixtures/vds-guardian.sudoers-5a78cb9"
 fi
+if git -C "$ROOT" cat-file -e 3d20e7d^{commit} 2>/dev/null; then
+  cmp -s <(git -C "$ROOT" show 3d20e7d:src/vds-guardianctl) "$ROOT/tests/fixtures/vds-guardianctl-3d20e7d"
+  cmp -s <(git -C "$ROOT" show 3d20e7d:src/vds-guardian.sudoers) "$ROOT/tests/fixtures/vds-guardian.sudoers-3d20e7d"
+fi
 
 # Inspection templates must select only reviewed metadata and must never dump
 # environment, label maps, config/secret contents, or volume mountpoints.
@@ -29,7 +33,8 @@ if grep -En '\{\{[[:space:]]*(json[[:space:]]+)?\.Config\.Env|\{\{[[:space:]]*(j
 fi
 grep -Fq 'compose_project={{printf "%q" (index .Labels "com.docker.compose.project")}} compose_volume={{printf "%q" (index .Labels "com.docker.compose.volume")}} compose_version={{printf "%q" (index .Labels "com.docker.compose.version")}}' "$ROOT/src/vds-guardianctl"
 grep -Fq 'compose_project={{printf "%q" (index .Labels "com.docker.compose.project")}} compose_network={{printf "%q" (index .Labels "com.docker.compose.network")}} compose_version={{printf "%q" (index .Labels "com.docker.compose.version")}}' "$ROOT/src/vds-guardianctl"
-grep -Fq 'name={{printf "%q" .Name}} source={{printf "%q" .Source}}' "$ROOT/src/vds-guardianctl"
+grep -Fq 'name={{printf "%q" (or (index . "Name") "")}} source={{printf "%q" .Source}}' "$ROOT/src/vds-guardianctl"
+! grep -Fq 'name={{printf "%q" .Name}} source={{printf "%q" .Source}}' "$ROOT/src/vds-guardianctl"
 
 run_container_test() {
   local mode=$1
@@ -116,6 +121,8 @@ adduser --disabled-password --gecos "" guardian >/dev/null
 
 baseline_helper=4a1d6c53954b5b88f5a7c01821377142f1e998dc37ac388a4e74d40729282e08
 baseline_sudoers=125a74e6ffa5c50d3fecf8142cc7c5a1de3017e455a1c91f87e6f298c8309020
+baseline_v2_helper=7c2fe0ed76f2811b9905f1f975c1e8de526313c9466bfb32fd229a7e696e46ae
+baseline_v2_sudoers=3580b0d94eb24be1d5a18cab2e6bc40e83c7ec1c09c8fc552f97c595ab131341
 new_helper=$(sha256sum /repo/src/vds-guardianctl | cut -d" " -f1)
 new_sudoers=$(sha256sum /repo/src/vds-guardian.sudoers | cut -d" " -f1)
 
@@ -125,6 +132,14 @@ install_baseline() {
   install -o root -g root -m 0440 /repo/tests/fixtures/vds-guardian.sudoers-5a78cb9 /etc/sudoers.d/vds-guardian
   test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline_helper"
   test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$baseline_sudoers"
+}
+
+install_baseline_v2() {
+  rm -f /usr/local/sbin/vds-guardianctl /etc/sudoers.d/vds-guardian
+  install -o root -g root -m 0755 /repo/tests/fixtures/vds-guardianctl-3d20e7d /usr/local/sbin/vds-guardianctl
+  install -o root -g root -m 0440 /repo/tests/fixtures/vds-guardian.sudoers-3d20e7d /etc/sudoers.d/vds-guardian
+  test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline_v2_helper"
+  test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$baseline_v2_sudoers"
 }
 
 install_baseline
@@ -197,6 +212,21 @@ test ! -e /tmp/fake-docker.commands
 bash /repo/dist/upgrade-existing.sh >/tmp/upgrade-idempotent.log
 test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$new_helper"
 test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$new_sudoers"
+
+# The immediately previous published pair upgrades, but supported hashes from
+# different releases cannot be mixed into an accepted baseline.
+install_baseline_v2
+bash /repo/dist/upgrade-existing.sh >/tmp/upgrade-v2.log
+test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$new_helper"
+test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$new_sudoers"
+install_baseline_v2
+install -o root -g root -m 0440 /repo/tests/fixtures/vds-guardian.sudoers-5a78cb9 /etc/sudoers.d/vds-guardian
+if bash /repo/dist/upgrade-existing.sh >/tmp/mixed-baseline.log 2>&1; then
+  echo "upgrade accepted a mixed supported baseline pair" >&2
+  exit 81
+fi
+test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline_v2_helper"
+test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$baseline_sudoers"
 
 # Either member drifting from the exact baseline rejects the whole upgrade.
 install_baseline

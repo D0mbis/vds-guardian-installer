@@ -7,9 +7,11 @@ export LC_ALL=C
 readonly HELPER_PATH='/usr/local/sbin/vds-guardianctl'
 readonly SUDOERS_PATH='/etc/sudoers.d/vds-guardian'
 readonly LOCK_PATH='/run/vds-guardian-upgrade.lock'
-readonly BASELINE_HELPER_SHA256='4a1d6c53954b5b88f5a7c01821377142f1e998dc37ac388a4e74d40729282e08'
-readonly BASELINE_SUDOERS_SHA256='125a74e6ffa5c50d3fecf8142cc7c5a1de3017e455a1c91f87e6f298c8309020'
-readonly NEW_HELPER_SHA256='7c2fe0ed76f2811b9905f1f975c1e8de526313c9466bfb32fd229a7e696e46ae'
+readonly BASELINE_V1_HELPER_SHA256='4a1d6c53954b5b88f5a7c01821377142f1e998dc37ac388a4e74d40729282e08'
+readonly BASELINE_V1_SUDOERS_SHA256='125a74e6ffa5c50d3fecf8142cc7c5a1de3017e455a1c91f87e6f298c8309020'
+readonly BASELINE_V2_HELPER_SHA256='7c2fe0ed76f2811b9905f1f975c1e8de526313c9466bfb32fd229a7e696e46ae'
+readonly BASELINE_V2_SUDOERS_SHA256='3580b0d94eb24be1d5a18cab2e6bc40e83c7ec1c09c8fc552f97c595ab131341'
+readonly NEW_HELPER_SHA256='699c1c32b3397cd43302fe3a1a14ec3360e7f95427df8452f8735e61b182117d'
 readonly NEW_SUDOERS_SHA256='3580b0d94eb24be1d5a18cab2e6bc40e83c7ec1c09c8fc552f97c595ab131341'
 
 fail() {
@@ -95,6 +97,8 @@ require_safe_file "$HELPER_PATH" 755
 require_safe_file "$SUDOERS_PATH" 440
 current_helper_sha256=$(file_sha256 "$HELPER_PATH")
 current_sudoers_sha256=$(file_sha256 "$SUDOERS_PATH")
+selected_baseline_helper_sha256=''
+selected_baseline_sudoers_sha256=''
 
 getent passwd guardian >/dev/null || fail 'guardian account does not exist'
 guardian_uid=$(id -u guardian) || fail 'cannot determine guardian uid'
@@ -146,13 +150,13 @@ rollback_and_verify() {
     || { printf '%s\n' 'CRITICAL: failed to restore original sudoers file' >&2; failed=1; }
 
   if ! safe_file "$HELPER_PATH" 755 \
-    || [[ $(sha256sum -- "$HELPER_PATH" 2>/dev/null) != "$BASELINE_HELPER_SHA256  $HELPER_PATH" ]] \
+    || [[ $(sha256sum -- "$HELPER_PATH" 2>/dev/null) != "$selected_baseline_helper_sha256  $HELPER_PATH" ]] \
     || ! bash -n "$HELPER_PATH"; then
     printf '%s\n' 'CRITICAL: restored helper failed metadata, hash, or syntax verification' >&2
     failed=1
   fi
   if ! safe_file "$SUDOERS_PATH" 440 \
-    || [[ $(sha256sum -- "$SUDOERS_PATH" 2>/dev/null) != "$BASELINE_SUDOERS_SHA256  $SUDOERS_PATH" ]] \
+    || [[ $(sha256sum -- "$SUDOERS_PATH" 2>/dev/null) != "$selected_baseline_sudoers_sha256  $SUDOERS_PATH" ]] \
     || ! visudo -cf "$SUDOERS_PATH"; then
     printf '%s\n' 'CRITICAL: restored sudoers failed metadata, hash, or visudo verification' >&2
     failed=1
@@ -243,7 +247,7 @@ audit_compose_projects() {
       [[ -n ${id} ]] || continue
       docker inspect --type container --format 'id={{printf "%q" .Id}} name={{printf "%q" .Name}} image={{printf "%q" .Config.Image}} state={{printf "%q" .State.Status}} restart_policy={{printf "%q" .HostConfig.RestartPolicy.Name}}
 compose_project={{printf "%q" (index .Config.Labels "com.docker.compose.project")}} compose_service={{printf "%q" (index .Config.Labels "com.docker.compose.service")}} compose_working_dir={{printf "%q" (index .Config.Labels "com.docker.compose.project.working_dir")}} compose_config_files={{printf "%q" (index .Config.Labels "com.docker.compose.project.config_files")}} compose_oneoff={{printf "%q" (index .Config.Labels "com.docker.compose.oneoff")}} compose_version={{printf "%q" (index .Config.Labels "com.docker.compose.version")}}
-{{range .Mounts}}mount type={{printf "%q" .Type}} name={{printf "%q" .Name}} source={{printf "%q" .Source}} destination={{printf "%q" .Destination}} rw={{.RW}}
+{{range .Mounts}}mount type={{printf "%q" .Type}} name={{printf "%q" (or (index . "Name") "")}} source={{printf "%q" .Source}} destination={{printf "%q" .Destination}} rw={{.RW}}
 {{end}}{{range $name, $network := .NetworkSettings.Networks}}network name={{printf "%q" $name}} id={{printf "%q" $network.NetworkID}}
 {{end}}' "${id}" || fail "could not inspect docker container ${id}"
     done <<<"${ids}"
@@ -486,22 +490,29 @@ if [[ ${current_helper_sha256} == "$NEW_HELPER_SHA256" && ${current_sudoers_sha2
   exit 0
 fi
 
-[[ ${current_helper_sha256} == "$BASELINE_HELPER_SHA256" ]] \
-  || fail 'installed helper does not match the exact supported baseline; no changes made'
-[[ ${current_sudoers_sha256} == "$BASELINE_SUDOERS_SHA256" ]] \
-  || fail 'installed sudoers does not match the exact supported baseline; no changes made'
+case "${current_helper_sha256}:${current_sudoers_sha256}" in
+  "${BASELINE_V1_HELPER_SHA256}:${BASELINE_V1_SUDOERS_SHA256}")
+    selected_baseline_helper_sha256=$BASELINE_V1_HELPER_SHA256
+    selected_baseline_sudoers_sha256=$BASELINE_V1_SUDOERS_SHA256
+    ;;
+  "${BASELINE_V2_HELPER_SHA256}:${BASELINE_V2_SUDOERS_SHA256}")
+    selected_baseline_helper_sha256=$BASELINE_V2_HELPER_SHA256
+    selected_baseline_sudoers_sha256=$BASELINE_V2_SUDOERS_SHA256
+    ;;
+  *) fail 'installed helper and sudoers do not match an exact supported baseline pair; no changes made' ;;
+esac
 
 # Repeat the complete boundary, leaf metadata, and baseline hash checks directly
 # before backup, then prove both private backup copies match that baseline.
-require_installed_state "$BASELINE_HELPER_SHA256" "$BASELINE_SUDOERS_SHA256"
+require_installed_state "$selected_baseline_helper_sha256" "$selected_baseline_sudoers_sha256"
 install -m 600 -o root -g root -- "$HELPER_PATH" "$tmpdir/original-helper"
 install -m 600 -o root -g root -- "$SUDOERS_PATH" "$tmpdir/original-sudoers"
-[[ $(file_sha256 "$tmpdir/original-helper") == "$BASELINE_HELPER_SHA256" ]] || fail 'helper changed while preparing backup'
-[[ $(file_sha256 "$tmpdir/original-sudoers") == "$BASELINE_SUDOERS_SHA256" ]] || fail 'sudoers changed while preparing backup'
+[[ $(file_sha256 "$tmpdir/original-helper") == "$selected_baseline_helper_sha256" ]] || fail 'helper changed while preparing backup'
+[[ $(file_sha256 "$tmpdir/original-sudoers") == "$selected_baseline_sudoers_sha256" ]] || fail 'sudoers changed while preparing backup'
 
 # Repeat once more immediately before installation. Replacement is staged in
 # each verified destination directory and mv -T replaces the leaf itself.
-require_installed_state "$BASELINE_HELPER_SHA256" "$BASELINE_SUDOERS_SHA256"
+require_installed_state "$selected_baseline_helper_sha256" "$selected_baseline_sudoers_sha256"
 mutation_started=1
 atomic_replace "$tmpdir/new-helper" "$HELPER_PATH" 0755
 atomic_replace "$tmpdir/new-sudoers" "$SUDOERS_PATH" 0440
