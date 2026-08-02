@@ -1,0 +1,52 @@
+#!/usr/bin/python3
+import json,os,sys
+state_path=os.environ.get('FAKE_DOCKER_STATE','/tmp/mutation-state.json')
+log_path=os.environ.get('FAKE_DOCKER_LOG','/tmp/mutation-docker.log')
+a=sys.argv[1:]
+with open(log_path,'a') as f:f.write(' '.join(a)+'\n')
+with open(state_path) as f:s=json.load(f)
+mut=a and (a[0] in {'update','stop','rm'} or a[:2] in [['volume','rm'],['network','rm'],['image','rm']])
+if mut:
+ s['mutation_count']=s.get('mutation_count',0)+1
+ if s.get('fail_mutation')==s['mutation_count']:
+  with open(state_path,'w') as f:json.dump(s,f)
+  sys.exit(88)
+def save():
+ with open(state_path,'w') as f:json.dump(s,f)
+def cobj(c):
+ return {'Id':c['id'],'Name':'/'+c['name'],'Image':'sha256:'+c['image'],'Config':{'Labels':{'com.docker.compose.project':c['project'],'com.docker.compose.service':c['service']}},'HostConfig':{'RestartPolicy':{'Name':c['policy']}},'State':{'Status':c['state']},'Mounts':[{'Type':m['type'],'Name':m['name'],'Source':m['source'],'Destination':m['destination'],'RW':m['rw']} for m in c['mounts']],'NetworkSettings':{'Networks':{n['name']:{'NetworkID':n['id']} for n in c['networks']}}}
+def findc(i):return next((x for x in s['containers'] if x['id']==i or x['name']==i),None)
+if a==['info']:sys.exit(0)
+if a==['ps','-aq','--no-trunc']:
+ print('\n'.join(x['id'] for x in s['containers']));sys.exit(0)
+if a[:3]==['inspect','--type','container'] and len(a)==4:
+ if s.get('inspect_error') in {'all','container'}:print('permission denied while connecting to Docker daemon',file=sys.stderr);sys.exit(1)
+ c=findc(a[3])
+ if not c:print('Error: No such container: '+a[3],file=sys.stderr);sys.exit(1)
+ print(json.dumps([cobj(c)]));sys.exit(0)
+if a[:2]==['volume','inspect']:
+ if s.get('inspect_error') in {'all','volume'}:print('permission denied while connecting to Docker daemon',file=sys.stderr);sys.exit(1)
+ v=s['volumes'].get(a[2])
+ if not v:print('Error response from daemon: get '+a[2]+': no such volume',file=sys.stderr);sys.exit(1)
+ print(json.dumps([{'Name':a[2],'Driver':v['driver'],'Scope':v['scope'],'Labels':{'com.docker.compose.project':v['project'],'com.docker.compose.volume':v['compose_volume']}}]));sys.exit(0)
+if a[:2]==['network','inspect']:
+ if s.get('inspect_error') in {'all','network'}:print('permission denied while connecting to Docker daemon',file=sys.stderr);sys.exit(1)
+ n=next((x for x in s['networks'].values() if x['id']==a[2] or x['name']==a[2]),None)
+ if not n:print('Error response from daemon: network '+a[2]+' not found',file=sys.stderr);sys.exit(1)
+ endpoints={c['id']:{} for c in s['containers'] if any(z['id']==n['id'] for z in c['networks'])}
+ endpoints.update(n.get('extra_endpoints',{}))
+ print(json.dumps([{'Id':n['id'],'Name':n['name'],'Driver':n['driver'],'Scope':n['scope'],'Internal':n['internal'],'Labels':{'com.docker.compose.project':n['project'],'com.docker.compose.network':n['compose_network']},'Containers':endpoints}]));sys.exit(0)
+if a==['network','ls','-q','--no-trunc']:
+ print('\n'.join(x['id'] for x in s['networks'].values()));sys.exit(0)
+if a[:2]==['image','inspect']:
+ if s.get('inspect_error') in {'all','image'}:print('permission denied while connecting to Docker daemon',file=sys.stderr);sys.exit(1)
+ if a[2] not in s['images']:print('Error response from daemon: No such image: sha256:'+a[2],file=sys.stderr);sys.exit(1)
+ print(json.dumps([{'Id':'sha256:'+a[2]}]));sys.exit(0)
+if a[0]=='update' and a[1]=='--restart=no':findc(a[2])['policy']='no';save();sys.exit(0)
+if a[:3]==['stop','--time','30']:findc(a[3])['state']='exited';save();sys.exit(0)
+if a[0]=='rm' and len(a)==2:s['containers']=[x for x in s['containers'] if x['id']!=a[1]];save();sys.exit(0)
+if a[:2]==['volume','rm']:s['volumes'].pop(a[2]);save();sys.exit(0)
+if a[:2]==['network','rm']:
+ key=next(k for k,v in s['networks'].items() if v['id']==a[2]);s['networks'].pop(key);save();sys.exit(0)
+if a[:2]==['image','rm']:s['images'].remove(a[2]);save();sys.exit(0)
+print('unexpected',a,file=sys.stderr);sys.exit(90)

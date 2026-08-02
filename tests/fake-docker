@@ -31,7 +31,7 @@ require_format_fields() {
 
 readonly ps_format='id={{printf "%q" .ID}} name={{printf "%q" .Names}} image={{printf "%q" .Image}} state={{printf "%q" .State}} status={{printf "%q" .Status}}'
 readonly inventory_ps_format='container={{.Names}} image={{.Image}} status={{.Status}} ports={{.Ports}}'
-readonly container_format='id={{printf "%q" .Id}} name={{printf "%q" .Name}} image={{printf "%q" .Config.Image}} state={{printf "%q" .State.Status}} restart_policy={{printf "%q" .HostConfig.RestartPolicy.Name}}
+readonly container_format='id={{printf "%q" .Id}} name={{printf "%q" .Name}} image={{printf "%q" .Config.Image}} image_id={{printf "%q" .Image}} state={{printf "%q" .State.Status}} restart_policy={{printf "%q" .HostConfig.RestartPolicy.Name}}
 compose_project={{printf "%q" (index .Config.Labels "com.docker.compose.project")}} compose_service={{printf "%q" (index .Config.Labels "com.docker.compose.service")}} compose_working_dir={{printf "%q" (index .Config.Labels "com.docker.compose.project.working_dir")}} compose_config_files={{printf "%q" (index .Config.Labels "com.docker.compose.project.config_files")}} compose_oneoff={{printf "%q" (index .Config.Labels "com.docker.compose.oneoff")}} compose_version={{printf "%q" (index .Config.Labels "com.docker.compose.version")}}
 {{range .Mounts}}mount type={{printf "%q" .Type}} name={{printf "%q" (or (index . "Name") "")}} source={{printf "%q" .Source}} destination={{printf "%q" .Destination}} rw={{.RW}}
 {{end}}{{range $name, $network := .NetworkSettings.Networks}}network name={{printf "%q" $name}} id={{printf "%q" $network.NetworkID}}
@@ -70,7 +70,7 @@ fi
 
 if (( $# == 6 )) && [[ $1 == inspect && $2 == --type && $3 == container && $4 == --format && $6 == container-id ]]; then
   check_safe_format "$5"
-  require_format_fields "$5" '.Id' '.Name' '.Config.Image' '.State.Status' '.HostConfig.RestartPolicy.Name' \
+  require_format_fields "$5" '.Id' '.Name' '.Config.Image' '.Image' '.State.Status' '.HostConfig.RestartPolicy.Name' \
     'index .Config.Labels "com.docker.compose.project"' 'index .Config.Labels "com.docker.compose.service"' \
     'index .Config.Labels "com.docker.compose.project.working_dir"' 'index .Config.Labels "com.docker.compose.project.config_files"' \
     'index .Config.Labels "com.docker.compose.oneoff"' 'index .Config.Labels "com.docker.compose.version"' \
@@ -78,7 +78,7 @@ if (( $# == 6 )) && [[ $1 == inspect && $2 == --type && $3 == container && $4 ==
   [[ $5 != *'name={{printf "%q" .Name}} source={{printf "%q" .Source}}'* ]] || fail_unexpected 'unsafe-direct-mount-name-access'
   [[ $5 == "$container_format" ]] || fail_unexpected "$@"
   printf '%s\n' \
-    'id="container-id" name="/sample-container" image="sample-image" state="running" restart_policy="unless-stopped"' \
+    'id="container-id" name="/sample-container" image="sample-image" image_id="sha256:sample-image-id" state="running" restart_policy="unless-stopped"' \
     'compose_project="sample-project\nforged=true" compose_service="sample-service" compose_working_dir="/srv/sample" compose_config_files="/srv/sample/compose.yml" compose_oneoff="False" compose_version="2.0.0"' \
     'mount type="volume" name="sample-volume" source="/var/lib/docker/volumes/sample-volume/_data" destination="/data" rw=true' \
     'network name="sample-network" id="network-id"'

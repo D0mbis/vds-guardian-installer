@@ -11,6 +11,7 @@ bash -n "$ROOT/dist/install-existing.sh"
 bash -n "$ROOT/dist/upgrade-existing.sh"
 visudo -cf "$ROOT/src/vds-guardian.sudoers"
 (cd "$ROOT" && sha256sum -c SHA256SUMS)
+bash "$ROOT/tests/mutations.sh"
 
 # Fixtures make shallow CI independent of historical Git objects. When the
 # baseline commit is available locally, prove that they are byte-for-byte the
@@ -22,6 +23,10 @@ fi
 if git -C "$ROOT" cat-file -e 3d20e7d^{commit} 2>/dev/null; then
   cmp -s <(git -C "$ROOT" show 3d20e7d:src/vds-guardianctl) "$ROOT/tests/fixtures/vds-guardianctl-3d20e7d"
   cmp -s <(git -C "$ROOT" show 3d20e7d:src/vds-guardian.sudoers) "$ROOT/tests/fixtures/vds-guardian.sudoers-3d20e7d"
+fi
+if git -C "$ROOT" cat-file -e 3de0e74^{commit} 2>/dev/null; then
+  cmp -s <(git -C "$ROOT" show 3de0e74:src/vds-guardianctl) "$ROOT/tests/fixtures/vds-guardianctl-3de0e74"
+  cmp -s <(git -C "$ROOT" show 3de0e74:src/vds-guardian.sudoers) "$ROOT/tests/fixtures/vds-guardian.sudoers-3de0e74"
 fi
 
 # Inspection templates must select only reviewed metadata and must never dump
@@ -62,7 +67,7 @@ install -o root -g root -m 0755 /repo/tests/fake-docker /usr/bin/docker
 rm -f /tmp/fake-docker.commands
 sudo -u guardian sudo -n /usr/local/sbin/vds-guardianctl audit-compose-projects >/tmp/compose-audit.log
 grep -Fx 'id=\"container-id\" name=\"sample-container\" image=\"sample-image\" state=\"running\" status=\"Up 1 minute\"' /tmp/compose-audit.log
-grep -Fx 'id=\"container-id\" name=\"/sample-container\" image=\"sample-image\" state=\"running\" restart_policy=\"unless-stopped\"' /tmp/compose-audit.log
+grep -Fx 'id=\"container-id\" name=\"/sample-container\" image=\"sample-image\" image_id=\"sha256:sample-image-id\" state=\"running\" restart_policy=\"unless-stopped\"' /tmp/compose-audit.log
 grep -Fx 'compose_project=\"sample-project\nforged=true\" compose_service=\"sample-service\" compose_working_dir=\"/srv/sample\" compose_config_files=\"/srv/sample/compose.yml\" compose_oneoff=\"False\" compose_version=\"2.0.0\"' /tmp/compose-audit.log
 grep -Fx 'mount type=\"volume\" name=\"sample-volume\" source=\"/var/lib/docker/volumes/sample-volume/_data\" destination=\"/data\" rw=true' /tmp/compose-audit.log
 grep -Fx 'network name=\"sample-network\" id=\"network-id\"' /tmp/compose-audit.log
@@ -123,6 +128,8 @@ baseline_helper=4a1d6c53954b5b88f5a7c01821377142f1e998dc37ac388a4e74d40729282e08
 baseline_sudoers=125a74e6ffa5c50d3fecf8142cc7c5a1de3017e455a1c91f87e6f298c8309020
 baseline_v2_helper=7c2fe0ed76f2811b9905f1f975c1e8de526313c9466bfb32fd229a7e696e46ae
 baseline_v2_sudoers=3580b0d94eb24be1d5a18cab2e6bc40e83c7ec1c09c8fc552f97c595ab131341
+baseline_v3_helper=699c1c32b3397cd43302fe3a1a14ec3360e7f95427df8452f8735e61b182117d
+baseline_v3_sudoers=3580b0d94eb24be1d5a18cab2e6bc40e83c7ec1c09c8fc552f97c595ab131341
 new_helper=$(sha256sum /repo/src/vds-guardianctl | cut -d" " -f1)
 new_sudoers=$(sha256sum /repo/src/vds-guardian.sudoers | cut -d" " -f1)
 
@@ -140,6 +147,14 @@ install_baseline_v2() {
   install -o root -g root -m 0440 /repo/tests/fixtures/vds-guardian.sudoers-3d20e7d /etc/sudoers.d/vds-guardian
   test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline_v2_helper"
   test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$baseline_v2_sudoers"
+}
+
+install_baseline_v3() {
+  rm -f /usr/local/sbin/vds-guardianctl /etc/sudoers.d/vds-guardian
+  install -o root -g root -m 0755 /repo/tests/fixtures/vds-guardianctl-3de0e74 /usr/local/sbin/vds-guardianctl
+  install -o root -g root -m 0440 /repo/tests/fixtures/vds-guardian.sudoers-3de0e74 /etc/sudoers.d/vds-guardian
+  test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline_v3_helper"
+  test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$baseline_v3_sudoers"
 }
 
 install_baseline
@@ -213,8 +228,14 @@ bash /repo/dist/upgrade-existing.sh >/tmp/upgrade-idempotent.log
 test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$new_helper"
 test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$new_sudoers"
 
-# The immediately previous published pair upgrades, but supported hashes from
-# different releases cannot be mixed into an accepted baseline.
+# The currently deployed published pair upgrades successfully.
+install_baseline_v3
+bash /repo/dist/upgrade-existing.sh >/tmp/upgrade-v3.log
+test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$new_helper"
+test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$new_sudoers"
+
+# The older published pair also upgrades, but supported hashes from different
+# releases cannot be mixed into an accepted baseline.
 install_baseline_v2
 bash /repo/dist/upgrade-existing.sh >/tmp/upgrade-v2.log
 test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$new_helper"

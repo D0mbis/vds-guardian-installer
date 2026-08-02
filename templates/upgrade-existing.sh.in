@@ -11,6 +11,8 @@ readonly BASELINE_V1_HELPER_SHA256='4a1d6c53954b5b88f5a7c01821377142f1e998dc37ac
 readonly BASELINE_V1_SUDOERS_SHA256='125a74e6ffa5c50d3fecf8142cc7c5a1de3017e455a1c91f87e6f298c8309020'
 readonly BASELINE_V2_HELPER_SHA256='7c2fe0ed76f2811b9905f1f975c1e8de526313c9466bfb32fd229a7e696e46ae'
 readonly BASELINE_V2_SUDOERS_SHA256='3580b0d94eb24be1d5a18cab2e6bc40e83c7ec1c09c8fc552f97c595ab131341'
+readonly BASELINE_V3_HELPER_SHA256='699c1c32b3397cd43302fe3a1a14ec3360e7f95427df8452f8735e61b182117d'
+readonly BASELINE_V3_SUDOERS_SHA256='3580b0d94eb24be1d5a18cab2e6bc40e83c7ec1c09c8fc552f97c595ab131341'
 readonly NEW_HELPER_SHA256='__NEW_HELPER_SHA256__'
 readonly NEW_SUDOERS_SHA256='__NEW_SUDOERS_SHA256__'
 
@@ -213,6 +215,10 @@ case "${current_helper_sha256}:${current_sudoers_sha256}" in
   "${BASELINE_V2_HELPER_SHA256}:${BASELINE_V2_SUDOERS_SHA256}")
     selected_baseline_helper_sha256=$BASELINE_V2_HELPER_SHA256
     selected_baseline_sudoers_sha256=$BASELINE_V2_SUDOERS_SHA256
+    ;;
+  "${BASELINE_V3_HELPER_SHA256}:${BASELINE_V3_SUDOERS_SHA256}")
+    selected_baseline_helper_sha256=$BASELINE_V3_HELPER_SHA256
+    selected_baseline_sudoers_sha256=$BASELINE_V3_SUDOERS_SHA256
     ;;
   *) fail 'installed helper and sudoers do not match an exact supported baseline pair; no changes made' ;;
 esac
