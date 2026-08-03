@@ -28,6 +28,10 @@ if git -C "$ROOT" cat-file -e 3de0e74^{commit} 2>/dev/null; then
   cmp -s <(git -C "$ROOT" show 3de0e74:src/vds-guardianctl) "$ROOT/tests/fixtures/vds-guardianctl-3de0e74"
   cmp -s <(git -C "$ROOT" show 3de0e74:src/vds-guardian.sudoers) "$ROOT/tests/fixtures/vds-guardian.sudoers-3de0e74"
 fi
+if git -C "$ROOT" cat-file -e 16db836^{commit} 2>/dev/null; then
+  cmp -s <(git -C "$ROOT" show 16db836:src/vds-guardianctl) "$ROOT/tests/fixtures/vds-guardianctl-16db836"
+  cmp -s <(git -C "$ROOT" show 16db836:src/vds-guardian.sudoers) "$ROOT/tests/fixtures/vds-guardian.sudoers-16db836"
+fi
 
 # Inspection templates must select only reviewed metadata and must never dump
 # environment, label maps, config/secret contents, or volume mountpoints.
@@ -130,6 +134,8 @@ baseline_v2_helper=7c2fe0ed76f2811b9905f1f975c1e8de526313c9466bfb32fd229a7e696e4
 baseline_v2_sudoers=3580b0d94eb24be1d5a18cab2e6bc40e83c7ec1c09c8fc552f97c595ab131341
 baseline_v3_helper=699c1c32b3397cd43302fe3a1a14ec3360e7f95427df8452f8735e61b182117d
 baseline_v3_sudoers=3580b0d94eb24be1d5a18cab2e6bc40e83c7ec1c09c8fc552f97c595ab131341
+baseline_v4_helper=42dbb4c4146cbb323fa807a7f35ca6e813d4af03bda027f5f2de9f4c5f1a2169
+baseline_v4_sudoers=37a03d5d96f9a149acc42240068bf7ddcc3ec766fb13667f87812e289b3e0d76
 new_helper=$(sha256sum /repo/src/vds-guardianctl | cut -d" " -f1)
 new_sudoers=$(sha256sum /repo/src/vds-guardian.sudoers | cut -d" " -f1)
 
@@ -155,6 +161,14 @@ install_baseline_v3() {
   install -o root -g root -m 0440 /repo/tests/fixtures/vds-guardian.sudoers-3de0e74 /etc/sudoers.d/vds-guardian
   test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline_v3_helper"
   test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$baseline_v3_sudoers"
+}
+
+install_baseline_v4() {
+  rm -f /usr/local/sbin/vds-guardianctl /etc/sudoers.d/vds-guardian
+  install -o root -g root -m 0755 /repo/tests/fixtures/vds-guardianctl-16db836 /usr/local/sbin/vds-guardianctl
+  install -o root -g root -m 0440 /repo/tests/fixtures/vds-guardian.sudoers-16db836 /etc/sudoers.d/vds-guardian
+  test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline_v4_helper"
+  test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$baseline_v4_sudoers"
 }
 
 install_baseline
@@ -229,6 +243,12 @@ test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$new_help
 test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$new_sudoers"
 
 # The currently deployed published pair upgrades successfully.
+install_baseline_v4
+bash /repo/dist/upgrade-existing.sh >/tmp/upgrade-v4.log
+test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$new_helper"
+test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$new_sudoers"
+
+# The preceding published pair also upgrades successfully.
 install_baseline_v3
 bash /repo/dist/upgrade-existing.sh >/tmp/upgrade-v3.log
 test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$new_helper"
@@ -248,6 +268,15 @@ if bash /repo/dist/upgrade-existing.sh >/tmp/mixed-baseline.log 2>&1; then
 fi
 test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline_v2_helper"
 test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$baseline_sudoers"
+
+install_baseline_v4
+install -o root -g root -m 0440 /repo/tests/fixtures/vds-guardian.sudoers-3de0e74 /etc/sudoers.d/vds-guardian
+if bash /repo/dist/upgrade-existing.sh >/tmp/mixed-baseline-v4.log 2>&1; then
+  echo "upgrade accepted a mixed V4 baseline pair" >&2
+  exit 82
+fi
+test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline_v4_helper"
+test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$baseline_v3_sudoers"
 
 # Either member drifting from the exact baseline rejects the whole upgrade.
 install_baseline

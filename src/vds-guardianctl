@@ -271,7 +271,7 @@ manifest_mutation() {
   /usr/bin/python3 - "$1" "$2" <<'PY'
 import fcntl,json,os,re,stat,subprocess,sys
 D='/usr/bin/docker'; ID=re.compile(r'^[0-9a-f]{64}$'); NAME=re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$')
-SLOTS={'purge':('/etc/vds-guardian/manifests/purge.json','purge-approved-compose-project'),'quiesce':('/etc/vds-guardian/manifests/quiesce.json','quiesce-approved-compose-project')}
+SLOTS={'purge':('/etc/vds-guardian/manifests/purge.json','purge-approved-compose-project'),'quiesce':('/etc/vds-guardian/manifests/quiesce.json','quiesce-approved-compose-project'),'remove':('/home/guardian/.vds-guardian/remove-containers.json','remove-containers-preserve-data')}
 class Bad(Exception): pass
 def bad(s): raise Bad(s)
 def run(*a,js=False,missing=False):
@@ -322,11 +322,37 @@ def manifest_bytes(path):
   if len(b)>1048576:bad('manifest too large')
   return b
  finally:os.close(fd)
-def container(o,w,purge):
- want={'id','name','project','service','restart_policy'}|({'mounts','networks'} if purge else set());keys(o,want,w)
+def request_bytes(path):
+ try:
+  import pwd
+  guardian=pwd.getpwnam('guardian');uid=guardian.pw_uid;gid=guardian.pw_gid
+ except (KeyError,ImportError):bad('guardian account is unavailable')
+ expected=[('/',0,0,None),('/home',0,0,None),('/home/guardian',uid,gid,None),('/home/guardian/.vds-guardian',uid,gid,0o700)]
+ fds=[]
+ try:
+  fd=os.open('/',os.O_RDONLY|os.O_CLOEXEC|os.O_DIRECTORY|os.O_NOFOLLOW);fds.append(fd)
+  for full,eu,eg,emode in expected:
+   if full!='/':
+    fd=os.open(full.rsplit('/',1)[1],os.O_RDONLY|os.O_CLOEXEC|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=fd);fds.append(fd)
+   s=os.fstat(fd)
+   if not stat.S_ISDIR(s.st_mode) or s.st_uid!=eu or s.st_gid!=eg or s.st_mode&0o022 or (emode is not None and stat.S_IMODE(s.st_mode)!=emode):bad('unsafe guardian request parent')
+  fd=os.open('remove-containers.json',os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW,dir_fd=fd);fds.append(fd);s=os.fstat(fd)
+  if not stat.S_ISREG(s.st_mode) or s.st_uid!=uid or s.st_gid!=gid or stat.S_IMODE(s.st_mode)!=0o600:bad('request must be guardian-owned mode 0600 regular file')
+  b=os.read(fd,1048577)
+  if len(b)>1048576:bad('request too large')
+  return b
+ except OSError as e:bad('malformed or unsafe request: '+str(e))
+ finally:
+  for fd in reversed(fds):os.close(fd)
+def container(o,w,topology=False,image=False):
+ want={'id','name','project','service','restart_policy'}|({'mounts','networks'} if topology else set())|({'image_id','auto_remove'} if image else set());keys(o,want,w)
  c={k:text(o[k],w+'.'+k,ID if k=='id' else NAME if k in {'name','project','service'} else None) for k in ['id','name','project','service','restart_policy']}
  if c['restart_policy'] not in {'no','always','on-failure','unless-stopped'}:bad(w+' restart policy invalid')
- if purge:
+ if image:
+  if type(o['auto_remove']) is not bool:bad(w+' auto_remove invalid')
+  c['image_id']=fid(o['image_id'],w+'.image_id');c['auto_remove']=o['auto_remove']
+  if c['auto_remove']:bad(w+' auto-remove containers cannot be safely stopped while preserving data')
+ if topology:
   if type(o['mounts']) is not list or type(o['networks']) is not list:bad(w+' topology is not arrays')
   c['mounts']=[]
   for i,m in enumerate(o['mounts']):
@@ -346,13 +372,23 @@ def network(o,w):
  if type(o['internal']) is not bool:bad(w+' internal invalid')
  return {'id':fid(o['id'],w+'.id'),'name':text(o['name'],w+'.name',NAME),'driver':text(o['driver'],w+'.driver',NAME),'scope':text(o['scope'],w+'.scope',NAME),'internal':o['internal'],'project':optional_name(o['project'],w+'.project'),'compose_network':optional_name(o['compose_network'],w+'.compose_network')}
 def load(mode,path,action):
- try:o=json.loads(manifest_bytes(path).decode(),object_pairs_hook=pairs,parse_constant=lambda x:bad('invalid JSON number'))
- except (ValueError,UnicodeError,OSError) as e:bad('malformed or unsafe manifest: '+str(e))
- extra={'volumes','orphan_network','protected_networks','config_directory','image_ids'} if mode=='purge' else set();keys(o,{'schema','action','containers'}|extra,'manifest')
+ try:o=json.loads((request_bytes(path) if mode=='remove' else manifest_bytes(path)).decode(),object_pairs_hook=pairs,parse_constant=lambda x:bad('invalid JSON number'))
+ except (ValueError,UnicodeError,OSError) as e:bad('malformed or unsafe input: '+str(e))
+ extra={'volumes','orphan_network','protected_networks','config_directory','image_ids'} if mode=='purge' else {'volumes','networks'} if mode=='remove' else set();keys(o,{'schema','action','containers'}|extra,'request' if mode=='remove' else 'manifest')
  if type(o['schema']) is not int or o['schema']!=1 or o['action']!=action:bad('wrong manifest schema or action')
  if type(o['containers']) is not list or not 1<=len(o['containers'])<=128:bad('invalid container count')
- cs=[container(x,'containers[%d]'%i,mode=='purge') for i,x in enumerate(o['containers'])];uniq(cs,lambda x:x['id'],'containers');uniq(cs,lambda x:x['name'],'containers');m={'containers':cs}
- if mode!='purge':return m
+ cs=[container(x,'containers[%d]'%i,mode in {'purge','remove'},mode=='remove') for i,x in enumerate(o['containers'])];uniq(cs,lambda x:x['id'],'containers');uniq(cs,lambda x:x['name'],'containers');m={'containers':cs}
+ if mode=='quiesce':return m
+ if mode=='remove':
+  if type(o['volumes']) is not list or len(o['volumes'])>256 or type(o['networks']) is not list or len(o['networks'])>256:bad('invalid preservation inventory')
+  vs=[]
+  for v in o['volumes']:
+   keys(v,{'name','driver','scope','project','compose_volume'},'volume');vs.append({'name':text(v['name'],'volume.name',NAME),'driver':text(v['driver'],'volume.driver',NAME),'scope':text(v['scope'],'volume.scope',NAME),'project':optional_name(v['project'],'volume.project'),'compose_volume':optional_name(v['compose_volume'],'volume.compose_volume')})
+  ns=[network(x,'network') for x in o['networks']];uniq(vs,lambda x:x['name'],'volumes');uniq(ns,lambda x:x['id'],'networks');uniq(ns,lambda x:x['name'],'networks')
+  mounted={x['name'] for c in cs for x in c['mounts'] if x['type']=='volume'};attached={(x['id'],x['name']) for c in cs for x in c['networks']}
+  if mounted!={x['name'] for x in vs}:bad('declared volumes do not exactly match container mounts')
+  if attached!={(x['id'],x['name']) for x in ns}:bad('declared networks do not exactly match container topology')
+  m.update(volumes=vs,networks=ns);return m
  if type(o['volumes']) is not list or not 1<=len(o['volumes'])<=128:bad('invalid volume count')
  vs=[]
  for v in o['volumes']:
@@ -373,9 +409,9 @@ def inspect_c(i,missing=False):
  if x is None:return None
  if type(x) is not list or len(x)!=1:bad('invalid container inspect shape')
  try:
-  x=x[0]; labs=x['Config'].get('Labels') or {}; c={'id':x['Id'],'name':x['Name'].removeprefix('/'),'project':labs.get('com.docker.compose.project',''),'service':labs.get('com.docker.compose.service',''),'restart_policy':x['HostConfig']['RestartPolicy']['Name'],'state':x['State']['Status'],'image_id':image_id(x['Image'],'container image'),'mounts':[{'type':z['Type'],'name':z.get('Name',''),'source':z.get('Source',''),'destination':z['Destination'],'rw':z['RW']} for z in x['Mounts']],'networks':[{'name':k,'id':v['NetworkID']} for k,v in x['NetworkSettings']['Networks'].items()]}
+  x=x[0]; labs=x['Config'].get('Labels') or {}; c={'id':x['Id'],'name':x['Name'].removeprefix('/'),'project':labs.get('com.docker.compose.project',''),'service':labs.get('com.docker.compose.service',''),'restart_policy':x['HostConfig']['RestartPolicy']['Name'],'auto_remove':x['HostConfig']['AutoRemove'],'state':x['State']['Status'],'image_id':image_id(x['Image'],'container image'),'mounts':[{'type':z['Type'],'name':z.get('Name',''),'source':z.get('Source',''),'destination':z['Destination'],'rw':z['RW']} for z in x['Mounts']],'networks':[{'name':k,'id':v['NetworkID']} for k,v in x['NetworkSettings']['Networks'].items()]}
  except (KeyError,TypeError):bad('container inspect missing fields')
- if not ID.fullmatch(c['id']):bad('abbreviated Docker identity')
+ if not ID.fullmatch(c['id']) or type(c['auto_remove']) is not bool:bad('invalid container identity')
  return c
 def allc():
  ids=[x for x in run('ps','-aq','--no-trunc').splitlines() if x]
@@ -392,7 +428,7 @@ def inspect_n(i,missing=False):
  try:x=x[0];l=x.get('Labels') or {};return {'id':x['Id'],'name':x['Name'],'driver':x['Driver'],'scope':x['Scope'],'internal':x['Internal'],'project':l.get('com.docker.compose.project',''),'compose_network':l.get('com.docker.compose.network',''),'containers':x['Containers']}
  except (KeyError,IndexError,TypeError):bad('invalid network inspect')
 def samec(a,e,p):
- return all(a[k]==e[k] for k in ['id','name','project','service']) and (not p or (sorted(a['mounts'],key=lambda x:x['destination'])==sorted(e['mounts'],key=lambda x:x['destination']) and sorted(a['networks'],key=lambda x:x['name'])==sorted(e['networks'],key=lambda x:x['name'])))
+ return all(a[k]==e[k] for k in ['id','name','project','service']) and ('image_id' not in e or a['image_id']==e['image_id']) and ('auto_remove' not in e or a['auto_remove']==e['auto_remove']) and (not p or (sorted(a['mounts'],key=lambda x:x['destination'])==sorted(e['mounts'],key=lambda x:x['destination']) and sorted(a['networks'],key=lambda x:x['name'])==sorted(e['networks'],key=lambda x:x['name'])))
 def projects(m,p):
  ac=allc(); byid={x['id']:x for x in m['containers']};byn={x['name']:x for x in m['containers']}; pro={x['project'] for x in m['containers']}
  if not {x['id'] for x in ac if x['project'] in pro}<={*byid}:bad('project has unapproved container')
@@ -478,6 +514,20 @@ def prepurge(m):
   for i in run('network','ls','-q','--no-trunc').splitlines():
    if inspect_n(i)['name']==n['name']:bad('orphan network name replacement')
  boundary(m['config_directory'],m['containers']);return m['image_ids']
+def preservation(m):
+ for v in m['volumes']:
+  if inspect_v(v['name'],True)!=v:bad('preserved volume is missing or changed')
+ for n in m['networks']:
+  a=inspect_n(n['id'],True)
+  if a is None or {k:a[k] for k in n}!=n:bad('preserved network is missing or changed')
+def preremove(m):
+ ac=allc();byid={x['id']:x for x in ac};byn={x['name']:x for x in ac}
+ for e in m['containers']:
+  a=byid.get(e['id'])
+  if a is None:bad('requested container is absent before mutation')
+  if a['auto_remove']:bad('auto-remove containers cannot be safely stopped while preserving data')
+  if byn.get(e['name'],{}).get('id')!=e['id'] or not samec(a,e,True) or a['restart_policy']!=e['restart_policy']:bad('container identity, image, topology, or policy drift')
+ preservation(m)
 def rec(e,p,missing=False):
  a=inspect_c(e['id'],missing)
  if a is None:
@@ -540,6 +590,17 @@ def purge(m,images):
   if a is not None:
    if len(a)!=1 or image_id(a[0].get('Id'),'image inspect identity')!=i:bad('image identity drift')
    if i not in {x['image_id'] for x in allc()}:run('image','rm',i)
+def remove_preserve(m):
+ preremove(m)
+ stopall(m,True)
+ for e in m['containers']:
+  a=rec(e,True)
+  if a is None or a['state'] not in {'created','exited'} or a['restart_policy']!='no':bad('container not quiesced')
+  run('rm',e['id'])
+ for e in m['containers']:
+  if inspect_c(e['id'],True) is not None:bad('removed container is still present')
+  if any(x['name']==e['name'] for x in allc()):bad('removed container name was replaced')
+ preservation(m)
 def lock():
  fd=os.open('/run/vds-guardian-mutate.lock',os.O_RDWR|os.O_CREAT|os.O_CLOEXEC|os.O_NOFOLLOW,0o600);s=os.fstat(fd)
  if not stat.S_ISREG(s.st_mode) or s.st_uid or s.st_gid or stat.S_IMODE(s.st_mode)!=0o600:bad('unsafe mutation lock')
@@ -554,6 +615,7 @@ def main():
  try:
   m=load(mode,path,action);run('info')
   if mode=='purge':purge(m,prepurge(m))
+  elif mode=='remove':remove_preserve(m)
   else:projects(m,False);stopall(m,False)
   print('action='+action+' completed')
  finally:os.close(fd)
@@ -576,5 +638,6 @@ case "$1" in
   clean-docker-build-cache-30d) clean_docker_build_cache_30d ;;
   purge-approved-compose-project) manifest_mutation purge /etc/vds-guardian/manifests/purge.json ;;
   quiesce-approved-compose-project) manifest_mutation quiesce /etc/vds-guardian/manifests/quiesce.json ;;
+  remove-containers-preserve-data) manifest_mutation remove /home/guardian/.vds-guardian/remove-containers.json ;;
   *) fail 'action is not allowlisted' ;;
 esac

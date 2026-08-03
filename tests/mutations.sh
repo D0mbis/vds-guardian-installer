@@ -17,7 +17,7 @@ write_state() {
 import json,sys
 A,B,C,N,P,I=sys.argv[1:]
 mounts=[{"type":"volume","name":"app-data","source":"/var/lib/docker/volumes/app-data/_data","destination":"/data","rw":True},{"type":"bind","name":"","source":"/root/textbee","destination":"/app/config","rw":False}]
-def c(i,n,service):return {"id":i,"name":n,"project":"app","service":service,"policy":"unless-stopped","state":"running","image":I,"mounts":mounts,"networks":[{"id":P,"name":"shared-net"}]}
+def c(i,n,service):return {"id":i,"name":n,"project":"app","service":service,"policy":"unless-stopped","auto_remove":False,"state":"running","image":I,"mounts":mounts,"networks":[{"id":P,"name":"shared-net"}]}
 s={"containers":[c(A,"app-one","one"),c(B,"app-two","two")],"volumes":{"app-data":{"driver":"local","scope":"local","project":"","compose_volume":""}},"networks":{"orphan":{"id":N,"name":"app-orphan","driver":"bridge","scope":"local","internal":False,"project":"app","compose_network":"orphan"},"protected":{"id":P,"name":"shared-net","driver":"bridge","scope":"local","internal":False,"project":"","compose_network":""}},"images":[I],"mutation_count":0}
 json.dump(s,open("/tmp/mutation-state.json","w"))
 PY
@@ -44,6 +44,33 @@ o={"schema":1,"action":"quiesce-approved-compose-project","containers":[{"id":A,
 json.dump(o,open("/etc/vds-guardian/manifests/quiesce.json","w"))
 PY
  chmod 0400 /etc/vds-guardian/manifests/quiesce.json
+}
+write_remove_state() {
+ write_state
+ python3 - "$C" "$P" "$I" "$J" <<"PY"
+import json,sys
+C,P,I,J=sys.argv[1:];p="/tmp/mutation-state.json";s=json.load(open(p));anon="2"*64
+s["volumes"][anon]={"driver":"local","scope":"local","project":"","compose_volume":""}
+s["containers"].append({"id":C,"name":"other-stopped","project":"other","service":"worker","policy":"always","auto_remove":False,"state":"exited","image":J,"mounts":[{"type":"volume","name":anon,"source":"/var/lib/docker/volumes/"+anon+"/_data","destination":"/state","rw":True},{"type":"bind","name":"","source":"/srv/other","destination":"/config","rw":True}],"networks":[{"id":P,"name":"shared-net"}]})
+s["images"].append(J);json.dump(s,open(p,"w"))
+PY
+ install -d -o root -g root -m 0755 /srv/other; printf preserve >/srv/other/data
+}
+write_remove() {
+ install -d -o guardian -g guardian -m 0700 /home/guardian/.vds-guardian
+ python3 - "$A" "$C" "$P" "$I" "$J" <<"PY"
+import json,sys
+A,C,P,I,J=sys.argv[1:];state=json.load(open("/tmp/mutation-state.json"));wanted={A,C};cs=[]
+for x in state["containers"]:
+ if x["id"] in wanted:cs.append({"id":x["id"],"name":x["name"],"project":x["project"],"service":x["service"],"image_id":x["image"],"restart_policy":x["policy"],"auto_remove":x.get("auto_remove",False),"mounts":x["mounts"],"networks":x["networks"]})
+volumes=[]
+for name in {m["name"] for c in cs for m in c["mounts"] if m["type"]=="volume"}:
+ v=state["volumes"][name];volumes.append({"name":name,**v})
+n=state["networks"]["protected"];networks=[{k:n[k] for k in ["id","name","driver","scope","internal","project","compose_network"]}]
+o={"schema":1,"action":"remove-containers-preserve-data","containers":cs,"volumes":volumes,"networks":networks}
+json.dump(o,open("/home/guardian/.vds-guardian/remove-containers.json","w"))
+PY
+ chown guardian:guardian /home/guardian/.vds-guardian/remove-containers.json; chmod 0600 /home/guardian/.vds-guardian/remove-containers.json
 }
 mutations() { local n; n=$(grep -Ec "^(update|stop|rm|volume rm|network rm|image rm)" /tmp/mutation-docker.log 2>/dev/null || true); printf "%s\\n" "${n:-0}"; }
 # Strict malformed input refuses before even contacting Docker.
@@ -92,6 +119,83 @@ exec {lfd}>/run/vds-guardian-mutate.lock; chmod 600 /run/vds-guardian-mutate.loc
 ! /usr/local/sbin/vds-guardianctl quiesce-approved-compose-project >/tmp/lock 2>&1
 grep -Fq "another guardian mutation" /tmp/lock; test "$(mutations)" = 0
 flock -u "$lfd"; exec {lfd}>&-
+# Guardian-owned removal requests are strict and fail before mutation on unsafe
+# metadata, malformed/unknown keys, topology drift, replacements, or Docker errors.
+write_remove_state; write_remove; chmod 0644 /home/guardian/.vds-guardian/remove-containers.json
+! /usr/local/sbin/vds-guardianctl remove-containers-preserve-data >/tmp/reject 2>&1; test "$(mutations)" = 0
+write_remove_state; write_remove; chmod 0755 /home/guardian/.vds-guardian
+! /usr/local/sbin/vds-guardianctl remove-containers-preserve-data >/tmp/reject 2>&1; test "$(mutations)" = 0
+# A running --rm target with an anonymous volume is rejected by its exact
+# requested AutoRemove identity before update or stop. The fake models Docker
+# deleting the container and anonymous volume on stop, so both must remain with
+# zero mutation.
+write_remove_state
+python3 - "$A" <<"PY"
+import json,sys
+A=sys.argv[1];p="/tmp/mutation-state.json";s=json.load(open(p));anon="4"*64;c=next(x for x in s["containers"] if x["id"]==A);c["auto_remove"]=True;c["mounts"][0]={"type":"volume","name":anon,"source":"/var/lib/docker/volumes/"+anon+"/_data","destination":"/data","rw":True};s["volumes"][anon]={"driver":"local","scope":"local","project":"","compose_volume":""};json.dump(s,open(p,"w"))
+PY
+write_remove
+! /usr/local/sbin/vds-guardianctl remove-containers-preserve-data >/tmp/reject 2>&1
+grep -Fq "auto-remove containers cannot be safely stopped while preserving data" /tmp/reject
+test "$(mutations)" = 0
+python3 - "$A" <<"PY"
+import json,sys
+A=sys.argv[1];s=json.load(open("/tmp/mutation-state.json"));c=next(x for x in s["containers"] if x["id"]==A);assert c["state"]=="running" and c["auto_remove"] is True and "4"*64 in s["volumes"]
+PY
+write_remove_state; write_remove
+python3 - <<"PY"
+p="/home/guardian/.vds-guardian/remove-containers.json";b=open(p).read();open(p,"w").write(b.replace("\"schema\": 1","\"schema\": 1, \"schema\": 1",1))
+PY
+chown guardian:guardian /home/guardian/.vds-guardian/remove-containers.json; chmod 0600 /home/guardian/.vds-guardian/remove-containers.json
+! /usr/local/sbin/vds-guardianctl remove-containers-preserve-data >/tmp/reject 2>&1; test "$(mutations)" = 0
+write_remove_state; write_remove
+python3 - <<"PY"
+p="/home/guardian/.vds-guardian/remove-containers.json";b=open(p).read();open(p,"w").write(b[:-1]+",\"unknown\":1}")
+PY
+chown guardian:guardian /home/guardian/.vds-guardian/remove-containers.json; chmod 0600 /home/guardian/.vds-guardian/remove-containers.json
+! /usr/local/sbin/vds-guardianctl remove-containers-preserve-data >/tmp/reject 2>&1; test "$(mutations)" = 0
+write_remove_state; write_remove
+python3 - <<"PY"
+import json
+p="/tmp/mutation-state.json";s=json.load(open(p));s["containers"][0]["mounts"][0]["destination"]="/drift";json.dump(s,open(p,"w"))
+PY
+! /usr/local/sbin/vds-guardianctl remove-containers-preserve-data >/tmp/reject 2>&1; test "$(mutations)" = 0
+write_remove_state; write_remove
+python3 - "$A" <<"PY"
+import json,sys
+A=sys.argv[1];p="/tmp/mutation-state.json";s=json.load(open(p));s["containers"][0]["id"]="3"*64;json.dump(s,open(p,"w"))
+PY
+! /usr/local/sbin/vds-guardianctl remove-containers-preserve-data >/tmp/reject 2>&1; test "$(mutations)" = 0
+write_remove_state; write_remove
+python3 - <<"PY"
+import json
+p="/tmp/mutation-state.json";s=json.load(open(p));s["inspect_error"]="network";json.dump(s,open(p,"w"))
+PY
+! /usr/local/sbin/vds-guardianctl remove-containers-preserve-data >/tmp/reject 2>&1; test "$(mutations)" = 0
+# A Docker failure after mutations remains visible, does not trigger forbidden
+# cleanup, and leaves every data object present for an explicit retry.
+write_remove_state; write_remove
+python3 - <<"PY"
+import json
+p="/tmp/mutation-state.json";s=json.load(open(p));s["fail_mutation"]=4;json.dump(s,open(p,"w"))
+PY
+! /usr/local/sbin/vds-guardianctl remove-containers-preserve-data >/tmp/remove-partial 2>&1
+python3 - <<"PY"
+import json
+s=json.load(open("/tmp/mutation-state.json"));assert len(s["containers"])==3 and len(s["volumes"])==2 and len(s["networks"])==2 and len(s["images"])==2
+PY
+! grep -Eq "^(volume rm|network rm|image rm)" /tmp/mutation-docker.log
+# Running and stopped targets from different projects are removed by full ID;
+# an unrequested container in the same project and all data identities survive.
+write_remove_state; write_remove
+sudo -u guardian sudo -n /usr/local/sbin/vds-guardianctl remove-containers-preserve-data
+! sudo -u guardian sudo -n /usr/local/sbin/vds-guardianctl remove-containers-preserve-data extra >/dev/null 2>&1
+python3 - "$B" "$P" "$I" "$J" <<"PY"
+import json,sys,os
+B,P,I,J=sys.argv[1:];s=json.load(open("/tmp/mutation-state.json"));assert [x["id"] for x in s["containers"]]==[B];assert set(s["volumes"])=={"app-data","2"*64};assert s["networks"]["protected"]["id"]==P and set(s["images"])=={I,J};assert open("/srv/other/data").read()=="preserve" and os.path.exists("/root/textbee/file")
+PY
+! grep -Eq "^(volume rm|network rm|image rm)" /tmp/mutation-docker.log
+grep -Fxq "rm $A" /tmp/mutation-docker.log; grep -Fxq "rm $C" /tmp/mutation-docker.log
 # A generic inspect failure is never interpreted as intended absence.
 write_state; write_purge
 python3 - <<"PY"

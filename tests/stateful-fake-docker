@@ -14,7 +14,7 @@ if mut:
 def save():
  with open(state_path,'w') as f:json.dump(s,f)
 def cobj(c):
- return {'Id':c['id'],'Name':'/'+c['name'],'Image':'sha256:'+c['image'],'Config':{'Labels':{'com.docker.compose.project':c['project'],'com.docker.compose.service':c['service']}},'HostConfig':{'RestartPolicy':{'Name':c['policy']}},'State':{'Status':c['state']},'Mounts':[{'Type':m['type'],'Name':m['name'],'Source':m['source'],'Destination':m['destination'],'RW':m['rw']} for m in c['mounts']],'NetworkSettings':{'Networks':{n['name']:{'NetworkID':n['id']} for n in c['networks']}}}
+ return {'Id':c['id'],'Name':'/'+c['name'],'Image':'sha256:'+c['image'],'Config':{'Labels':{'com.docker.compose.project':c['project'],'com.docker.compose.service':c['service']}},'HostConfig':{'RestartPolicy':{'Name':c['policy']},'AutoRemove':c.get('auto_remove',False)},'State':{'Status':c['state']},'Mounts':[{'Type':m['type'],'Name':m['name'],'Source':m['source'],'Destination':m['destination'],'RW':m['rw']} for m in c['mounts']],'NetworkSettings':{'Networks':{n['name']:{'NetworkID':n['id']} for n in c['networks']}}}
 def findc(i):return next((x for x in s['containers'] if x['id']==i or x['name']==i),None)
 if a==['info']:sys.exit(0)
 if a==['ps','-aq','--no-trunc']:
@@ -43,7 +43,13 @@ if a[:2]==['image','inspect']:
  if a[2] not in s['images']:print('Error response from daemon: No such image: sha256:'+a[2],file=sys.stderr);sys.exit(1)
  print(json.dumps([{'Id':'sha256:'+a[2]}]));sys.exit(0)
 if a[0]=='update' and a[1]=='--restart=no':findc(a[2])['policy']='no';save();sys.exit(0)
-if a[:3]==['stop','--time','30']:findc(a[3])['state']='exited';save();sys.exit(0)
+if a[:3]==['stop','--time','30']:
+ c=findc(a[3]);c['state']='exited'
+ if c.get('auto_remove',False):
+  for m in c['mounts']:
+   if m['type']=='volume' and len(m['name'])==64 and all(z in '0123456789abcdef' for z in m['name']):s['volumes'].pop(m['name'],None)
+  s['containers']=[x for x in s['containers'] if x['id']!=c['id']]
+ save();sys.exit(0)
 if a[0]=='rm' and len(a)==2:s['containers']=[x for x in s['containers'] if x['id']!=a[1]];save();sys.exit(0)
 if a[:2]==['volume','rm']:s['volumes'].pop(a[2]);save();sys.exit(0)
 if a[:2]==['network','rm']:
