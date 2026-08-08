@@ -73,21 +73,30 @@ else
 fi
 id guardian
 stat -c '%U:%G %a %n' /usr/local/sbin/vds-guardianctl /etc/sudoers.d/vds-guardian
-mkdir -p /root/project/cache /root/project/nested/deep /root/backups
+mkdir -p /root/project/cache /root/project/nested/deep /root/project/.git /root/backups /root/token-dir
+dd if=/dev/zero of=/root/token-dir/payload bs=1024 count=200 status=none
 printf 'DO_NOT_DISCLOSE_CONTENT_9f3c\\n' >/root/project/password-token
 chmod 000 /root/project/password-token
 printf 'deep secret name and content\\n' >/root/project/nested/deep/api-key
 ln -s /etc/shadow /root/outside-link
+mkdir -p /root/deep-chain/\$(python3 -c 'print(\"/\".join([\"d\"]*70))')
+mkdir -p \$(python3 -c 'print(\" \".join(\"/root/entry-%02d\" % i for i in range(71)))')
 sudo -u guardian sudo -n /usr/local/sbin/vds-guardianctl audit-root-storage >/tmp/root-audit.log
+grep -F 'audit=root-storage progressive=1' /tmp/root-audit.log
+grep -E '^summary completed=[0-9]+ partial=[0-9]+ excluded=[0-9]+ not_audited=[0-9]+ entries=[0-9]+$' /tmp/root-audit.log
 ! grep -F 'DO_NOT_DISCLOSE_CONTENT_9f3c' /tmp/root-audit.log
 ! grep -F 'password-token' /tmp/root-audit.log
 ! grep -F 'api-key' /tmp/root-audit.log
 ! grep -F '/etc/shadow' /tmp/root-audit.log
-grep -E '^path=/root/project size=[0-9]+ owner=0:0 mode=0[0-7]{3,4} type=directory mtime=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' /tmp/root-audit.log
-grep -E '^path=/root/project/<redacted> size=[0-9]+ owner=0:0 mode=00 type=regular mtime=' /tmp/root-audit.log
-grep -E '^path=/root/outside-link size=[0-9]+ owner=0:0 mode=0[0-7]{3,4} type=symlink mtime=' /tmp/root-audit.log
-for category in cache backups Git logs temp; do grep -E '^category='\$category' size=[0-9]+$' /tmp/root-audit.log; done
+grep -E '^path=/root/project size=[0-9]+ status=complete owner=0:0 mode=0[0-7]{3,4} type=directory mtime=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' /tmp/root-audit.log
+grep -F 'path=/root/<redacted>' /tmp/root-audit.log
+grep -E '^path=/root/deep-chain size=[0-9]+ status=partial owner=0:0 mode=0[0-7]{3,4} type=directory mtime=.* reason=depth_limit entries=[0-9]+$' /tmp/root-audit.log
 ! grep -F '/root/project/nested/deep' /tmp/root-audit.log
+! grep -F 'limit=' /tmp/root-audit.log
+test \"\$(grep -c '^path=/root/entry-' /tmp/root-audit.log)\" -le 64
+test \"\$(grep -E '^summary ' /tmp/root-audit.log | grep -oE 'completed=[0-9]+' | cut -d= -f2)\" -ge 71
+for category in cache backups Git logs temp; do grep -E '^category='\$category' size=[0-9]+ status=(complete|partial)$' /tmp/root-audit.log; done
+grep -E '^category=logs size=[0-9]+ status=partial$' /tmp/root-audit.log
 if sudo -u guardian sudo -n /usr/local/sbin/vds-guardianctl audit-root-storage extra >/dev/null 2>&1; then
   echo 'audit-root-storage extra argument unexpectedly accepted' >&2; exit 37
 fi

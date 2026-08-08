@@ -18,8 +18,8 @@ readonly BASELINE_V4_SUDOERS_SHA256='37a03d5d96f9a149acc42240068bf7ddcc3ec766fb1
 # Exact source pair from commit 304d084 (fixtures vds-guardian{ctl,.sudoers}-304d084).
 readonly BASELINE_V5_HELPER_SHA256='26a83ff99dfd63640b0a14d069fdeb0a8235b1c80fefa4d8168d6d3064084fbc'
 readonly BASELINE_V5_SUDOERS_SHA256='d656075f924c9d5b047fa75c8072cdf99e399220b4e858fd435a36e492fb8004'
-readonly NEW_HELPER_SHA256='1e01e3f0e10b0a900da09ac5485bf74a4cc9843a47cc2aea921372029d4b5aed'
-readonly NEW_SUDOERS_SHA256='7ce85ca65cd4cb384fd514aaad0d00eb8a1ffc50e2a288f07a33f99f0f14eb94'
+readonly NEW_HELPER_SHA256='1c3a32d7bc6212b21d67cbbe1c3d3855875746670959cc9b595777c99f60e7ae'
+readonly NEW_SUDOERS_SHA256='9efe5dc71246b7ae3e27a6b2e3e23d224bbdd60a01b5ee4f46cfe90d7fd1b3d7'
 
 fail() {
   printf 'ERROR: %s\n' "$*" >&2
@@ -341,11 +341,16 @@ audit_root_storage() {
   /usr/bin/python3 - <<'PY'
 import datetime,fcntl,hashlib,io,os,re,stat,sys,time
 ROOT=b'/root'; DIR=os.O_RDONLY|os.O_CLOEXEC|os.O_DIRECTORY|os.O_NOFOLLOW; FILE=os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW
-MAX_ENTRIES=500000; MAX_DEPTH=64; MAX_SECONDS=120; MAX_REPORT=8388608
+SUBTREE_MAX_ENTRIES=250000; GLOBAL_MAX_ENTRIES=500000; MAX_DEPTH=64; MAX_SECONDS=120; MAX_REPORT=8388608; TOP_N=64; LIST_MAX=50
 AUTH=re.compile(rb'^# vds-guardianctl-sha256: ([0-9a-f]{64})$')
-SENSITIVE=re.compile(rb'(?:^\.|secret|token|pass(?:word)?|credential|private|auth|cookie|session|mnemonic|wallet|vault|seed|api[-_.]?key|ssh|gnupg|kubeconfig|id_(?:rsa|dsa|ecdsa|ed25519)|service[-_.]?account|\.env(?:\.|$)|(?:^|[-_.])(?:key|pem|p12|pfx|keystore)(?:[-_.]|$))',re.I)
+SENSITIVE=re.compile(rb'(?:^\\.|secret|token|pass(?:word)?|credential|private|auth|cookie|session|mnemonic|wallet|vault|seed|api[-_.]?key|ssh|gnupg|kubeconfig|id_(?:rsa|dsa|ecdsa|ed25519)|service[-_.]?account|\\.env(?:\\.|$)|(?:^|[-_.])(?:key|pem|p12|pfx|keystore)(?:[-_.]|$))',re.I)
 CATEGORIES=('cache','backups','Git','logs','temp')
 class Bad(Exception):pass
+class SubtreeLimit(Exception):pass
+class GlobalLimit(Exception):
+ def __init__(self,reason):
+  self.reason=reason;Exception.__init__(self,reason)
+class DepthLimit(Exception):pass
 def bad(s):raise Bad(s)
 def metadata(s,d,m=None):
  return s.st_uid==s.st_gid==0 and ((stat.S_ISDIR(s.st_mode) and not s.st_mode&0o022) if d else (stat.S_ISREG(s.st_mode) and stat.S_IMODE(s.st_mode)==m))
@@ -443,62 +448,113 @@ def mtime(s):
  except (OverflowError,OSError,ValueError):bad('unrepresentable object mtime')
 class Scanner:
  def __init__(self,m,d):
-  self.mounts=m;self.dev=d;self.count=0;self.deadline=time.monotonic()+MAX_SECONDS;self.totals={x:0 for x in CATEGORIES};self.files=set();self.category_files={x:set() for x in CATEGORIES}
+  self.mounts=m;self.dev=d;self.count=0;self.sub_count=0;self.sub_exhausted=False;self.global_stop=False;self.stop_reason=''
+  self.deadline=time.monotonic()+MAX_SECONDS;self.totals={x:0 for x in CATEGORIES};self.files=set();self.category_files={x:set() for x in CATEGORIES}
  def check(self):
-  if self.count>MAX_ENTRIES:bad('root storage audit entry limit exceeded')
-  if time.monotonic()>self.deadline:bad('root storage audit time limit exceeded')
- def reserve(self):
-  self.count+=1;self.check()
+  if time.monotonic()>self.deadline:raise GlobalLimit('time_limit')
+ def reserve_global(self):
+  self.count+=1
+  if self.count>GLOBAL_MAX_ENTRIES:raise GlobalLimit('entry_limit')
+  self.check()
+ def reserve_sub(self):
+  self.sub_count+=1;self.count+=1
+  if self.sub_count>SUBTREE_MAX_ENTRIES:raise SubtreeLimit()
+  if self.count>GLOBAL_MAX_ENTRIES:raise GlobalLimit('entry_limit')
+  self.check()
  def node(self,fd,n,path,label,depth,active):
   self.check()
-  if depth>MAX_DEPTH:bad('root storage audit depth limit exceeded')
-  if time.monotonic()>self.deadline:bad('root storage audit time limit exceeded')
-  if path in self.mounts and path!=ROOT:return None
+  if depth>MAX_DEPTH:raise DepthLimit()
+  if path in self.mounts and path!=ROOT:return {'excluded':'mount'}
   try:s=os.stat(n,dir_fd=fd,follow_symlinks=False)
   except OSError:bad('object metadata read failed')
   if s.st_dev!=self.dev:bad('object crossed an unrecorded mount boundary')
-  active=set(active)|categories(n);children=[];allocated=s.st_blocks*512
+  active=set(active)|categories(n);allocated=s.st_blocks*512
   key=(s.st_dev,s.st_ino) if stat.S_ISREG(s.st_mode) else None
   if key is not None:
    if key in self.files:allocated=0
    else:self.files.add(key)
-  total=allocated
+  total=allocated;status='complete';reason=''
   if stat.S_ISDIR(s.st_mode):
    try:c=os.open(n,DIR,dir_fd=fd)
    except OSError:bad('directory open failed')
    try:
     a=os.fstat(c)
     if (a.st_dev,a.st_ino,a.st_mode)!=(s.st_dev,s.st_ino,s.st_mode):bad('directory changed during traversal')
-    ns=names(c,self.reserve,self.check)
+    ns=names(c,self.reserve_sub,self.check)
     if b'.git' in ns:active.add('Git')
     for cn in ns:
      child=self.node(c,cn,path+b'/'+cn,label+'/'+shown(cn),depth+1,active)
-     if child is not None:
-      total+=child['size']
-      if depth<2:children.append(child)
+     if child is None:continue
+     if child.get('excluded')=='mount':
+      status='partial';reason='mount'
+      continue
+     total+=child['size']
+     if child['status']=='partial':
+      status='partial'
+      if not reason:reason=child['reason']
+     if self.sub_exhausted or self.global_stop:break
+   except SubtreeLimit:
+    status='partial';reason='entry_limit';self.sub_exhausted=True
+   except DepthLimit:
+    status='partial';reason='depth_limit'
+   except GlobalLimit as e:
+    status='partial';reason='global_entry_limit';self.global_stop=True;self.stop_reason=e.reason
    finally:os.close(c)
   for x in active:
    if key is None:self.totals[x]+=s.st_blocks*512
    elif key not in self.category_files[x]:self.category_files[x].add(key);self.totals[x]+=s.st_blocks*512
-  return {'path':label,'size':total,'owner':'%d:%d'%(s.st_uid,s.st_gid),'mode':'0%o'%stat.S_IMODE(s.st_mode),'type':ftype(s.st_mode),'mtime':mtime(s),'children':children}
-def line(n):return 'path={path} size={size} owner={owner} mode={mode} type={type} mtime={mtime}\n'.format(**n)
+  return {'path':label,'size':total,'status':status,'reason':reason,'owner':'%d:%d'%(s.st_uid,s.st_gid),'mode':'0%o'%stat.S_IMODE(s.st_mode),'type':ftype(s.st_mode),'mtime':mtime(s)}
+def line(n):
+ s='path=%s size=%d status=%s owner=%s mode=%s type=%s mtime=%s'%(n['path'],n['size'],n['status'],n['owner'],n['mode'],n['type'],n['mtime'])
+ if n['status']=='partial':s+=' reason=%s entries=%d'%(n['reason'],n['entries'])
+ return s+'\n'
+def audit(fd,mounts):
+ sc=Scanner(mounts,os.fstat(fd).st_dev);completed=[];partials=[];excluded=[];not_audited=[]
+ try:
+  top=names(fd,sc.reserve_global,sc.check)
+ except GlobalLimit as e:
+  sc.global_stop=True;sc.stop_reason=e.reason;top=[]
+ for n in top:
+  if sc.global_stop:
+   not_audited.append('/root/'+shown(n));continue
+  sc.sub_count=0;sc.sub_exhausted=False
+  try:
+   x=sc.node(fd,n,ROOT+b'/'+n,'/root/'+shown(n),1,set())
+  except GlobalLimit as e:
+   sc.global_stop=True;sc.stop_reason=e.reason
+   not_audited.append('/root/'+shown(n));continue
+  if x is None:continue
+  if x.get('excluded')=='mount':
+   excluded.append({'path':'/root/'+shown(n),'reason':'mount'});continue
+  if x['status']=='partial':
+   x['entries']=sc.sub_count;partials.append(x)
+  else:completed.append(x)
+ out=io.StringIO()
+ out.write('audit=root-storage progressive=1 limits subtree=%d global=%d depth=%d top=%d\n'%(SUBTREE_MAX_ENTRIES,GLOBAL_MAX_ENTRIES,MAX_DEPTH,TOP_N))
+ na='unbounded' if (sc.global_stop and not top) else str(len(not_audited))
+ out.write('summary completed=%d partial=%d excluded=%d not_audited=%s entries=%d\n'%(len(completed),len(partials),len(excluded),na,sc.count))
+ if sc.global_stop:out.write('limit=%s\n'%sc.stop_reason)
+ completed.sort(key=lambda x:x['size'],reverse=True)
+ for x in completed[:TOP_N]:out.write(line(x))
+ partials.sort(key=lambda x:x['size'],reverse=True)
+ for x in partials[:LIST_MAX]:out.write(line(x))
+ if len(partials)>LIST_MAX:out.write('partial_more=%d\n'%(len(partials)-LIST_MAX))
+ for x in excluded[:LIST_MAX]:out.write('excluded path=%s reason=mount\n'%x['path'])
+ if len(excluded)>LIST_MAX:out.write('excluded_more=%d\n'%(len(excluded)-LIST_MAX))
+ for p in not_audited[:LIST_MAX]:out.write('not_audited path=%s\n'%p)
+ if len(not_audited)>LIST_MAX:out.write('not_audited_more=%d\n'%(len(not_audited)-LIST_MAX))
+ cat_status='complete' if (not partials and not excluded and not not_audited and not sc.global_stop) else 'partial'
+ for c in CATEGORIES:out.write('category=%s size=%d status=%s\n'%(c,sc.totals[c],cat_status))
+ data=out.getvalue().encode('ascii')
+ if len(data)>MAX_REPORT:bad('root storage audit output limit exceeded')
+ return data
 def main():
  if os.geteuid()!=0:bad('must run through the approved sudo rule')
  precheck();lf=lock();rf=[]
  try:
-  mp,mi=mounts();rf=chain([b'root']);sc=Scanner(mp,os.fstat(rf[-1]).st_dev);records=[]
-  for n in names(rf[-1],sc.reserve,sc.check):
-   x=sc.node(rf[-1],n,ROOT+b'/'+n,'/root/'+shown(n),1,set())
-   if x is not None:records.append(x)
+  mp,mi=mounts();rf=chain([b'root']);data=audit(rf[-1],mp)
   mp2,mi2=mounts()
   if mp2!=mp or mi2!=mi:bad('mount boundary inventory changed during audit')
-  out=io.StringIO()
-  for n in records:
-   out.write(line(n))
-   for c in n['children']:out.write(line(c))
-  for c in CATEGORIES:out.write('category=%s size=%d\n'%(c,sc.totals[c]))
-  data=out.getvalue().encode('ascii')
-  if len(data)>MAX_REPORT:bad('root storage audit output limit exceeded')
   while data:data=data[os.write(1,data):]
  finally:
   for x in reversed(rf):os.close(x)
@@ -1022,7 +1078,7 @@ VDS_GUARDIAN_HELPER
 cat >"$tmpdir/new-sudoers" <<'VDS_GUARDIAN_SUDOERS'
 # Managed capability boundary for the vds-guardian Hermes profile.
 # Every allowed command has fixed arguments; no wildcard or arbitrary path is permitted.
-# vds-guardianctl-sha256: 1e01e3f0e10b0a900da09ac5485bf74a4cc9843a47cc2aea921372029d4b5aed
+# vds-guardianctl-sha256: 1c3a32d7bc6212b21d67cbbe1c3d3855875746670959cc9b595777c99f60e7ae
 Cmnd_Alias VDS_GUARDIAN_AUDIT = /usr/local/sbin/vds-guardianctl audit-compose-projects, /usr/local/sbin/vds-guardianctl audit-root-storage, /usr/local/sbin/vds-guardianctl audit-storage, /usr/local/sbin/vds-guardianctl audit-services, /usr/local/sbin/vds-guardianctl audit-security, /usr/local/sbin/vds-guardianctl verify-health
 Cmnd_Alias VDS_GUARDIAN_CLEAN = /usr/local/sbin/vds-guardianctl clean-apt-cache, /usr/local/sbin/vds-guardianctl vacuum-journal-30d, /usr/local/sbin/vds-guardianctl clean-tmpfiles, /usr/local/sbin/vds-guardianctl clean-docker-build-cache-30d
 Cmnd_Alias VDS_GUARDIAN_MANIFEST_MUTATE = /usr/local/sbin/vds-guardianctl purge-approved-compose-project, /usr/local/sbin/vds-guardianctl quiesce-approved-compose-project, /usr/local/sbin/vds-guardianctl remove-containers-preserve-data
