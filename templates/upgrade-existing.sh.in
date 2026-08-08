@@ -15,6 +15,9 @@ readonly BASELINE_V3_HELPER_SHA256='699c1c32b3397cd43302fe3a1a14ec3360e7f95427df
 readonly BASELINE_V3_SUDOERS_SHA256='3580b0d94eb24be1d5a18cab2e6bc40e83c7ec1c09c8fc552f97c595ab131341'
 readonly BASELINE_V4_HELPER_SHA256='42dbb4c4146cbb323fa807a7f35ca6e813d4af03bda027f5f2de9f4c5f1a2169'
 readonly BASELINE_V4_SUDOERS_SHA256='37a03d5d96f9a149acc42240068bf7ddcc3ec766fb13667f87812e289b3e0d76'
+# Exact source pair from commit 304d084 (fixtures vds-guardian{ctl,.sudoers}-304d084).
+readonly BASELINE_V5_HELPER_SHA256='26a83ff99dfd63640b0a14d069fdeb0a8235b1c80fefa4d8168d6d3064084fbc'
+readonly BASELINE_V5_SUDOERS_SHA256='d656075f924c9d5b047fa75c8072cdf99e399220b4e858fd435a36e492fb8004'
 readonly NEW_HELPER_SHA256='__NEW_HELPER_SHA256__'
 readonly NEW_SUDOERS_SHA256='__NEW_SUDOERS_SHA256__'
 
@@ -29,6 +32,7 @@ fail() {
 for command in bash cat cmp flock getent id install mktemp mv rm sha256sum stat visudo; do
   command -v "$command" >/dev/null 2>&1 || fail "required command is missing: $command"
 done
+[[ -x /usr/bin/python3 ]] || fail 'required interpreter is missing: /usr/bin/python3'
 
 safe_dir() {
   local path=$1 metadata uid gid mode type mode_number
@@ -61,6 +65,13 @@ file_sha256() {
   printf '%s\n' "${output%% *}"
 }
 
+require_helper_authority() {
+  local helper=$1 sudoers=$2 digest
+  digest=$(file_sha256 "$helper")
+  grep -Fqx -- "# vds-guardianctl-sha256: $digest" "$sudoers" \
+    || fail 'sudoers detached helper hash authority does not match helper'
+}
+
 require_all_parents() {
   local parent
   for parent in / /usr /usr/local /usr/local/sbin /etc /etc/sudoers.d; do
@@ -75,6 +86,9 @@ require_installed_state() {
   require_safe_file "$SUDOERS_PATH" 440
   [[ $(file_sha256 "$HELPER_PATH") == "$expected_helper" ]] || fail 'installed helper hash changed'
   [[ $(file_sha256 "$SUDOERS_PATH") == "$expected_sudoers" ]] || fail 'installed sudoers hash changed'
+  if [[ $expected_helper == "$NEW_HELPER_SHA256" ]]; then
+    require_helper_authority "$HELPER_PATH" "$SUDOERS_PATH"
+  fi
 }
 
 # Validate the lock boundary before opening. / and /run are root-only writable,
@@ -195,6 +209,7 @@ VDS_GUARDIAN_SUDOERS
 
 [[ $(file_sha256 "$tmpdir/new-helper") == "$NEW_HELPER_SHA256" ]] || fail 'embedded helper hash does not match the reviewed build'
 [[ $(file_sha256 "$tmpdir/new-sudoers") == "$NEW_SUDOERS_SHA256" ]] || fail 'embedded sudoers hash does not match the reviewed build'
+require_helper_authority "$tmpdir/new-helper" "$tmpdir/new-sudoers"
 bash -n "$tmpdir/new-helper"
 visudo -cf "$tmpdir/new-sudoers"
 
@@ -225,6 +240,10 @@ case "${current_helper_sha256}:${current_sudoers_sha256}" in
   "${BASELINE_V4_HELPER_SHA256}:${BASELINE_V4_SUDOERS_SHA256}")
     selected_baseline_helper_sha256=$BASELINE_V4_HELPER_SHA256
     selected_baseline_sudoers_sha256=$BASELINE_V4_SUDOERS_SHA256
+    ;;
+  "${BASELINE_V5_HELPER_SHA256}:${BASELINE_V5_SUDOERS_SHA256}")
+    selected_baseline_helper_sha256=$BASELINE_V5_HELPER_SHA256
+    selected_baseline_sudoers_sha256=$BASELINE_V5_SUDOERS_SHA256
     ;;
   *) fail 'installed helper and sudoers do not match an exact supported baseline pair; no changes made' ;;
 esac

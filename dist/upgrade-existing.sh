@@ -15,8 +15,11 @@ readonly BASELINE_V3_HELPER_SHA256='699c1c32b3397cd43302fe3a1a14ec3360e7f95427df
 readonly BASELINE_V3_SUDOERS_SHA256='3580b0d94eb24be1d5a18cab2e6bc40e83c7ec1c09c8fc552f97c595ab131341'
 readonly BASELINE_V4_HELPER_SHA256='42dbb4c4146cbb323fa807a7f35ca6e813d4af03bda027f5f2de9f4c5f1a2169'
 readonly BASELINE_V4_SUDOERS_SHA256='37a03d5d96f9a149acc42240068bf7ddcc3ec766fb13667f87812e289b3e0d76'
-readonly NEW_HELPER_SHA256='26a83ff99dfd63640b0a14d069fdeb0a8235b1c80fefa4d8168d6d3064084fbc'
-readonly NEW_SUDOERS_SHA256='d656075f924c9d5b047fa75c8072cdf99e399220b4e858fd435a36e492fb8004'
+# Exact source pair from commit 304d084 (fixtures vds-guardian{ctl,.sudoers}-304d084).
+readonly BASELINE_V5_HELPER_SHA256='26a83ff99dfd63640b0a14d069fdeb0a8235b1c80fefa4d8168d6d3064084fbc'
+readonly BASELINE_V5_SUDOERS_SHA256='d656075f924c9d5b047fa75c8072cdf99e399220b4e858fd435a36e492fb8004'
+readonly NEW_HELPER_SHA256='1e01e3f0e10b0a900da09ac5485bf74a4cc9843a47cc2aea921372029d4b5aed'
+readonly NEW_SUDOERS_SHA256='7ce85ca65cd4cb384fd514aaad0d00eb8a1ffc50e2a288f07a33f99f0f14eb94'
 
 fail() {
   printf 'ERROR: %s\n' "$*" >&2
@@ -29,6 +32,7 @@ fail() {
 for command in bash cat cmp flock getent id install mktemp mv rm sha256sum stat visudo; do
   command -v "$command" >/dev/null 2>&1 || fail "required command is missing: $command"
 done
+[[ -x /usr/bin/python3 ]] || fail 'required interpreter is missing: /usr/bin/python3'
 
 safe_dir() {
   local path=$1 metadata uid gid mode type mode_number
@@ -61,6 +65,13 @@ file_sha256() {
   printf '%s\n' "${output%% *}"
 }
 
+require_helper_authority() {
+  local helper=$1 sudoers=$2 digest
+  digest=$(file_sha256 "$helper")
+  grep -Fqx -- "# vds-guardianctl-sha256: $digest" "$sudoers" \
+    || fail 'sudoers detached helper hash authority does not match helper'
+}
+
 require_all_parents() {
   local parent
   for parent in / /usr /usr/local /usr/local/sbin /etc /etc/sudoers.d; do
@@ -75,6 +86,9 @@ require_installed_state() {
   require_safe_file "$SUDOERS_PATH" 440
   [[ $(file_sha256 "$HELPER_PATH") == "$expected_helper" ]] || fail 'installed helper hash changed'
   [[ $(file_sha256 "$SUDOERS_PATH") == "$expected_sudoers" ]] || fail 'installed sudoers hash changed'
+  if [[ $expected_helper == "$NEW_HELPER_SHA256" ]]; then
+    require_helper_authority "$HELPER_PATH" "$SUDOERS_PATH"
+  fi
 }
 
 # Validate the lock boundary before opening. / and /run are root-only writable,
@@ -320,6 +334,179 @@ audit_storage() {
 
   section 'docker storage summary'
   show_docker_inventory
+}
+
+audit_root_storage() {
+  [[ -x /usr/bin/python3 ]] || fail 'python3 is required'
+  /usr/bin/python3 - <<'PY'
+import datetime,fcntl,hashlib,io,os,re,stat,sys,time
+ROOT=b'/root'; DIR=os.O_RDONLY|os.O_CLOEXEC|os.O_DIRECTORY|os.O_NOFOLLOW; FILE=os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW
+MAX_ENTRIES=500000; MAX_DEPTH=64; MAX_SECONDS=120; MAX_REPORT=8388608
+AUTH=re.compile(rb'^# vds-guardianctl-sha256: ([0-9a-f]{64})$')
+SENSITIVE=re.compile(rb'(?:^\.|secret|token|pass(?:word)?|credential|private|auth|cookie|session|mnemonic|wallet|vault|seed|api[-_.]?key|ssh|gnupg|kubeconfig|id_(?:rsa|dsa|ecdsa|ed25519)|service[-_.]?account|\.env(?:\.|$)|(?:^|[-_.])(?:key|pem|p12|pfx|keystore)(?:[-_.]|$))',re.I)
+CATEGORIES=('cache','backups','Git','logs','temp')
+class Bad(Exception):pass
+def bad(s):raise Bad(s)
+def metadata(s,d,m=None):
+ return s.st_uid==s.st_gid==0 and ((stat.S_ISDIR(s.st_mode) and not s.st_mode&0o022) if d else (stat.S_ISREG(s.st_mode) and stat.S_IMODE(s.st_mode)==m))
+def chain(parts,mode=None):
+ f=[]
+ try:
+  x=os.open(b'/',DIR);f.append(x)
+  if not metadata(os.fstat(x),True):bad('unsafe trusted directory metadata')
+  for i,p in enumerate(parts):
+   leaf=i==len(parts)-1 and mode is not None;x=os.open(p,FILE if leaf else DIR,dir_fd=x);f.append(x)
+   if not metadata(os.fstat(x),not leaf,mode):bad('unsafe trusted path metadata')
+  return f
+ except:
+  for x in reversed(f):os.close(x)
+  raise
+def readfd(fd,n,label):
+ out=[];size=0
+ while True:
+  b=os.read(fd,min(65536,n+1-size))
+  if not b:return b''.join(out)
+  out.append(b);size+=len(b)
+  if size>n:bad(label+' is too large')
+def precheck():
+ h=chain([b'usr',b'local',b'sbin',b'vds-guardianctl'],0o755);s=chain([b'etc',b'sudoers.d',b'vds-guardian'],0o440)
+ try:
+  hb=readfd(h[-1],1048576,'helper');sb=readfd(s[-1],65536,'sudoers authority');ds=[]
+  for line in sb.splitlines():
+   m=AUTH.fullmatch(line)
+   if m:ds.append(m.group(1))
+  if len(ds)!=1:bad('sudoers helper authority is missing or ambiguous')
+  if hashlib.sha256(hb).hexdigest().encode()!=ds[0]:bad('helper does not match the sudoers hash authority')
+ finally:
+  for x in reversed(h+s):os.close(x)
+def unescape(v):
+ out=bytearray();i=0
+ while i<len(v):
+  if v[i:i+1]!=b'\\':out.append(v[i]);i+=1;continue
+  e=v[i+1:i+4]
+  if len(e)!=3 or any(c<48 or c>55 for c in e):bad('malformed mount boundary inventory')
+  out.append(int(e,8));i+=4
+ return bytes(out)
+def mounts():
+ try:
+  fd=os.open(b'/proc/self/mountinfo',FILE)
+  try:data=readfd(fd,8388608,'mount boundary inventory')
+  finally:os.close(fd)
+ except OSError:bad('cannot inspect mount boundaries')
+ out=set()
+ for line in data.splitlines():
+  f=line.split(b' ')
+  if len(f)<10 or b'-' not in f[6:]:bad('malformed mount boundary inventory')
+  p=unescape(f[4])
+  if not p.startswith(b'/') or b'\0' in p:bad('malformed mount boundary path')
+  out.add(p)
+ if b'/' not in out:bad('incomplete mount boundary inventory')
+ return out,data
+def lock():
+ f=chain([b'run'])
+ try:
+  x=os.open(b'vds-guardian-audit-root-storage.lock',os.O_RDWR|os.O_CREAT|os.O_CLOEXEC|os.O_NOFOLLOW,0o600,dir_fd=f[-1]);s=os.fstat(x)
+  if not metadata(s,False,0o600):os.close(x);bad('unsafe audit lock metadata')
+  try:fcntl.flock(x,fcntl.LOCK_EX|fcntl.LOCK_NB)
+  except BlockingIOError:os.close(x);bad('another root storage audit is already running')
+  return x
+ finally:
+  for x in reversed(f):os.close(x)
+def names(fd,reserve,check):
+ try:
+  with os.scandir(fd) as it:
+   a=[]
+   for x in it:
+    reserve()
+    a.append(os.fsencode(x.name))
+   check()
+   a.sort()
+   check()
+ except OSError:bad('directory enumeration failed')
+ if any(not x or x in (b'.',b'..') or b'/' in x or b'\0' in x for x in a):bad('unsafe directory entry name')
+ return a
+def shown(n):
+ return n.decode() if not SENSITIVE.search(n) and re.fullmatch(rb'[A-Za-z0-9][A-Za-z0-9._+-]{0,127}',n) else '<redacted>'
+def categories(n):
+ n=n.lower();r=set()
+ if n in (b'cache',b'caches',b'.cache') or b'cache' in n:r.add('cache')
+ if n in (b'backup',b'backups',b'archive',b'archives',b'snapshot',b'snapshots') or n.endswith((b'.bak',b'.backup',b'.old',b'.tar',b'.tgz',b'.gz',b'.bz2',b'.xz',b'.zip',b'.7z')):r.add('backups')
+ if n in (b'log',b'logs') or n.endswith((b'.log',b'.log.1')):r.add('logs')
+ if n in (b'tmp',b'temp',b'temporary') or n.endswith((b'.tmp',b'.swp',b'~')):r.add('temp')
+ return r
+def ftype(m):
+ for p,n in ((stat.S_ISREG,'regular'),(stat.S_ISDIR,'directory'),(stat.S_ISLNK,'symlink'),(stat.S_ISBLK,'block'),(stat.S_ISCHR,'character'),(stat.S_ISFIFO,'fifo'),(stat.S_ISSOCK,'socket')):
+  if p(m):return n
+ return 'other'
+def mtime(s):
+ try:return datetime.datetime.fromtimestamp(s.st_mtime_ns//1000000000,datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+ except (OverflowError,OSError,ValueError):bad('unrepresentable object mtime')
+class Scanner:
+ def __init__(self,m,d):
+  self.mounts=m;self.dev=d;self.count=0;self.deadline=time.monotonic()+MAX_SECONDS;self.totals={x:0 for x in CATEGORIES};self.files=set();self.category_files={x:set() for x in CATEGORIES}
+ def check(self):
+  if self.count>MAX_ENTRIES:bad('root storage audit entry limit exceeded')
+  if time.monotonic()>self.deadline:bad('root storage audit time limit exceeded')
+ def reserve(self):
+  self.count+=1;self.check()
+ def node(self,fd,n,path,label,depth,active):
+  self.check()
+  if depth>MAX_DEPTH:bad('root storage audit depth limit exceeded')
+  if time.monotonic()>self.deadline:bad('root storage audit time limit exceeded')
+  if path in self.mounts and path!=ROOT:return None
+  try:s=os.stat(n,dir_fd=fd,follow_symlinks=False)
+  except OSError:bad('object metadata read failed')
+  if s.st_dev!=self.dev:bad('object crossed an unrecorded mount boundary')
+  active=set(active)|categories(n);children=[];allocated=s.st_blocks*512
+  key=(s.st_dev,s.st_ino) if stat.S_ISREG(s.st_mode) else None
+  if key is not None:
+   if key in self.files:allocated=0
+   else:self.files.add(key)
+  total=allocated
+  if stat.S_ISDIR(s.st_mode):
+   try:c=os.open(n,DIR,dir_fd=fd)
+   except OSError:bad('directory open failed')
+   try:
+    a=os.fstat(c)
+    if (a.st_dev,a.st_ino,a.st_mode)!=(s.st_dev,s.st_ino,s.st_mode):bad('directory changed during traversal')
+    ns=names(c,self.reserve,self.check)
+    if b'.git' in ns:active.add('Git')
+    for cn in ns:
+     child=self.node(c,cn,path+b'/'+cn,label+'/'+shown(cn),depth+1,active)
+     if child is not None:
+      total+=child['size']
+      if depth<2:children.append(child)
+   finally:os.close(c)
+  for x in active:
+   if key is None:self.totals[x]+=s.st_blocks*512
+   elif key not in self.category_files[x]:self.category_files[x].add(key);self.totals[x]+=s.st_blocks*512
+  return {'path':label,'size':total,'owner':'%d:%d'%(s.st_uid,s.st_gid),'mode':'0%o'%stat.S_IMODE(s.st_mode),'type':ftype(s.st_mode),'mtime':mtime(s),'children':children}
+def line(n):return 'path={path} size={size} owner={owner} mode={mode} type={type} mtime={mtime}\n'.format(**n)
+def main():
+ if os.geteuid()!=0:bad('must run through the approved sudo rule')
+ precheck();lf=lock();rf=[]
+ try:
+  mp,mi=mounts();rf=chain([b'root']);sc=Scanner(mp,os.fstat(rf[-1]).st_dev);records=[]
+  for n in names(rf[-1],sc.reserve,sc.check):
+   x=sc.node(rf[-1],n,ROOT+b'/'+n,'/root/'+shown(n),1,set())
+   if x is not None:records.append(x)
+  mp2,mi2=mounts()
+  if mp2!=mp or mi2!=mi:bad('mount boundary inventory changed during audit')
+  out=io.StringIO()
+  for n in records:
+   out.write(line(n))
+   for c in n['children']:out.write(line(c))
+  for c in CATEGORIES:out.write('category=%s size=%d\n'%(c,sc.totals[c]))
+  data=out.getvalue().encode('ascii')
+  if len(data)>MAX_REPORT:bad('root storage audit output limit exceeded')
+  while data:data=data[os.write(1,data):]
+ finally:
+  for x in reversed(rf):os.close(x)
+  os.close(lf)
+try:main()
+except Bad as message:print('ERROR: '+str(message),file=sys.stderr);sys.exit(1)
+except Exception:print('ERROR: root storage audit failed',file=sys.stderr);sys.exit(1)
+PY
 }
 
 audit_services() {
@@ -816,6 +1003,7 @@ require_root_and_integrity "$@"
 
 case "$1" in
   audit-compose-projects) audit_compose_projects ;;
+  audit-root-storage) audit_root_storage ;;
   audit-storage) audit_storage ;;
   audit-services) audit_services ;;
   audit-security) audit_security ;;
@@ -834,7 +1022,8 @@ VDS_GUARDIAN_HELPER
 cat >"$tmpdir/new-sudoers" <<'VDS_GUARDIAN_SUDOERS'
 # Managed capability boundary for the vds-guardian Hermes profile.
 # Every allowed command has fixed arguments; no wildcard or arbitrary path is permitted.
-Cmnd_Alias VDS_GUARDIAN_AUDIT = /usr/local/sbin/vds-guardianctl audit-compose-projects, /usr/local/sbin/vds-guardianctl audit-storage, /usr/local/sbin/vds-guardianctl audit-services, /usr/local/sbin/vds-guardianctl audit-security, /usr/local/sbin/vds-guardianctl verify-health
+# vds-guardianctl-sha256: 1e01e3f0e10b0a900da09ac5485bf74a4cc9843a47cc2aea921372029d4b5aed
+Cmnd_Alias VDS_GUARDIAN_AUDIT = /usr/local/sbin/vds-guardianctl audit-compose-projects, /usr/local/sbin/vds-guardianctl audit-root-storage, /usr/local/sbin/vds-guardianctl audit-storage, /usr/local/sbin/vds-guardianctl audit-services, /usr/local/sbin/vds-guardianctl audit-security, /usr/local/sbin/vds-guardianctl verify-health
 Cmnd_Alias VDS_GUARDIAN_CLEAN = /usr/local/sbin/vds-guardianctl clean-apt-cache, /usr/local/sbin/vds-guardianctl vacuum-journal-30d, /usr/local/sbin/vds-guardianctl clean-tmpfiles, /usr/local/sbin/vds-guardianctl clean-docker-build-cache-30d
 Cmnd_Alias VDS_GUARDIAN_MANIFEST_MUTATE = /usr/local/sbin/vds-guardianctl purge-approved-compose-project, /usr/local/sbin/vds-guardianctl quiesce-approved-compose-project, /usr/local/sbin/vds-guardianctl remove-containers-preserve-data
 guardian ALL=(root) NOPASSWD: VDS_GUARDIAN_AUDIT, VDS_GUARDIAN_CLEAN, VDS_GUARDIAN_MANIFEST_MUTATE
@@ -842,6 +1031,7 @@ VDS_GUARDIAN_SUDOERS
 
 [[ $(file_sha256 "$tmpdir/new-helper") == "$NEW_HELPER_SHA256" ]] || fail 'embedded helper hash does not match the reviewed build'
 [[ $(file_sha256 "$tmpdir/new-sudoers") == "$NEW_SUDOERS_SHA256" ]] || fail 'embedded sudoers hash does not match the reviewed build'
+require_helper_authority "$tmpdir/new-helper" "$tmpdir/new-sudoers"
 bash -n "$tmpdir/new-helper"
 visudo -cf "$tmpdir/new-sudoers"
 
@@ -872,6 +1062,10 @@ case "${current_helper_sha256}:${current_sudoers_sha256}" in
   "${BASELINE_V4_HELPER_SHA256}:${BASELINE_V4_SUDOERS_SHA256}")
     selected_baseline_helper_sha256=$BASELINE_V4_HELPER_SHA256
     selected_baseline_sudoers_sha256=$BASELINE_V4_SUDOERS_SHA256
+    ;;
+  "${BASELINE_V5_HELPER_SHA256}:${BASELINE_V5_SUDOERS_SHA256}")
+    selected_baseline_helper_sha256=$BASELINE_V5_HELPER_SHA256
+    selected_baseline_sudoers_sha256=$BASELINE_V5_SUDOERS_SHA256
     ;;
   *) fail 'installed helper and sudoers do not match an exact supported baseline pair; no changes made' ;;
 esac

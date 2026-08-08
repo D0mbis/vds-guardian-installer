@@ -3,12 +3,14 @@ set -Eeuo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 IMAGE=${VDS_GUARDIAN_TEST_IMAGE:-debian:12-slim}
+DOCKER_RUN=(docker run --rm --cpus=2 --memory=1g --memory-swap=1g --pids-limit=512)
 
 python3 "$ROOT/tools/build.py"
 bash -n "$ROOT/src/vds-guardianctl"
 bash -n "$ROOT/dist/install-new.sh"
 bash -n "$ROOT/dist/install-existing.sh"
 bash -n "$ROOT/dist/upgrade-existing.sh"
+python3 "$ROOT/tests/audit-root-storage-static.py"
 visudo -cf "$ROOT/src/vds-guardian.sudoers"
 (cd "$ROOT" && sha256sum -c SHA256SUMS)
 bash "$ROOT/tests/mutations.sh"
@@ -32,6 +34,10 @@ if git -C "$ROOT" cat-file -e 16db836^{commit} 2>/dev/null; then
   cmp -s <(git -C "$ROOT" show 16db836:src/vds-guardianctl) "$ROOT/tests/fixtures/vds-guardianctl-16db836"
   cmp -s <(git -C "$ROOT" show 16db836:src/vds-guardian.sudoers) "$ROOT/tests/fixtures/vds-guardian.sudoers-16db836"
 fi
+if git -C "$ROOT" cat-file -e 304d084^{commit} 2>/dev/null; then
+  cmp -s <(git -C "$ROOT" show 304d084:src/vds-guardianctl) "$ROOT/tests/fixtures/vds-guardianctl-304d084"
+  cmp -s <(git -C "$ROOT" show 304d084:src/vds-guardian.sudoers) "$ROOT/tests/fixtures/vds-guardian.sudoers-304d084"
+fi
 
 # Inspection templates must select only reviewed metadata and must never dump
 # environment, label maps, config/secret contents, or volume mountpoints.
@@ -47,10 +53,10 @@ grep -Fq 'name={{printf "%q" (or (index . "Name") "")}} source={{printf "%q" .So
 
 run_container_test() {
   local mode=$1
-  docker run --rm -v "$ROOT:/repo:ro" "$IMAGE" bash -lc "
+  "${DOCKER_RUN[@]}" -v "$ROOT:/repo:ro" "$IMAGE" bash -lc "
 set -Eeuo pipefail
 apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sudo openssh-client iproute2 >/dev/null
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sudo python3 openssh-client iproute2 >/dev/null
 if [[ '$mode' == new ]]; then
   ssh-keygen -q -t ed25519 -N '' -f /tmp/test_guardian_key
   public_key=\$(cat /tmp/test_guardian_key.pub)
@@ -67,6 +73,39 @@ else
 fi
 id guardian
 stat -c '%U:%G %a %n' /usr/local/sbin/vds-guardianctl /etc/sudoers.d/vds-guardian
+mkdir -p /root/project/cache /root/project/nested/deep /root/backups
+printf 'DO_NOT_DISCLOSE_CONTENT_9f3c\\n' >/root/project/password-token
+chmod 000 /root/project/password-token
+printf 'deep secret name and content\\n' >/root/project/nested/deep/api-key
+ln -s /etc/shadow /root/outside-link
+sudo -u guardian sudo -n /usr/local/sbin/vds-guardianctl audit-root-storage >/tmp/root-audit.log
+! grep -F 'DO_NOT_DISCLOSE_CONTENT_9f3c' /tmp/root-audit.log
+! grep -F 'password-token' /tmp/root-audit.log
+! grep -F 'api-key' /tmp/root-audit.log
+! grep -F '/etc/shadow' /tmp/root-audit.log
+grep -E '^path=/root/project size=[0-9]+ owner=0:0 mode=0[0-7]{3,4} type=directory mtime=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' /tmp/root-audit.log
+grep -E '^path=/root/project/<redacted> size=[0-9]+ owner=0:0 mode=00 type=regular mtime=' /tmp/root-audit.log
+grep -E '^path=/root/outside-link size=[0-9]+ owner=0:0 mode=0[0-7]{3,4} type=symlink mtime=' /tmp/root-audit.log
+for category in cache backups Git logs temp; do grep -E '^category='\$category' size=[0-9]+$' /tmp/root-audit.log; done
+! grep -F '/root/project/nested/deep' /tmp/root-audit.log
+if sudo -u guardian sudo -n /usr/local/sbin/vds-guardianctl audit-root-storage extra >/dev/null 2>&1; then
+  echo 'audit-root-storage extra argument unexpectedly accepted' >&2; exit 37
+fi
+cp /etc/sudoers.d/vds-guardian /tmp/good-sudoers
+printf '# vds-guardianctl-sha256: %064d\\n' 0 >>/etc/sudoers.d/vds-guardian
+if sudo -u guardian sudo -n /usr/local/sbin/vds-guardianctl audit-root-storage >/tmp/drift-audit.log 2>/tmp/drift-audit.err; then
+  echo 'audit-root-storage accepted ambiguous authority' >&2; exit 38
+fi
+test ! -s /tmp/drift-audit.log
+install -o root -g root -m 0440 /tmp/good-sudoers /etc/sudoers.d/vds-guardian
+exec {audit_lock_fd}>/run/vds-guardian-audit-root-storage.lock
+chmod 0600 /run/vds-guardian-audit-root-storage.lock
+flock -n "\$audit_lock_fd"
+if sudo -u guardian sudo -n /usr/local/sbin/vds-guardianctl audit-root-storage >/tmp/locked-audit.log 2>/tmp/locked-audit.err; then
+  echo 'audit-root-storage ignored its lock' >&2; exit 39
+fi
+test ! -s /tmp/locked-audit.log
+flock -u "\$audit_lock_fd"; exec {audit_lock_fd}>&-
 install -o root -g root -m 0755 /repo/tests/fake-docker /usr/bin/docker
 rm -f /tmp/fake-docker.commands
 sudo -u guardian sudo -n /usr/local/sbin/vds-guardianctl audit-compose-projects >/tmp/compose-audit.log
@@ -84,7 +123,7 @@ if grep -E '(^| )(stop|rm|prune|update|restart)( |$)|compose( |.* )down( |$)' /t
   echo 'mutation docker subcommand used by audit' >&2
   exit 30
 fi
-expected_rule='Cmnd_Alias VDS_GUARDIAN_AUDIT = /usr/local/sbin/vds-guardianctl audit-compose-projects, /usr/local/sbin/vds-guardianctl audit-storage, /usr/local/sbin/vds-guardianctl audit-services, /usr/local/sbin/vds-guardianctl audit-security, /usr/local/sbin/vds-guardianctl verify-health'
+expected_rule='Cmnd_Alias VDS_GUARDIAN_AUDIT = /usr/local/sbin/vds-guardianctl audit-compose-projects, /usr/local/sbin/vds-guardianctl audit-root-storage, /usr/local/sbin/vds-guardianctl audit-storage, /usr/local/sbin/vds-guardianctl audit-services, /usr/local/sbin/vds-guardianctl audit-security, /usr/local/sbin/vds-guardianctl verify-health'
 test \"\$(grep '^Cmnd_Alias VDS_GUARDIAN_AUDIT = ' /etc/sudoers.d/vds-guardian)\" = \"\$expected_rule\"
 touch /tmp/fake-docker.fail
 if sudo -u guardian sudo -n /usr/local/sbin/vds-guardianctl audit-compose-projects >/dev/null 2>&1; then
@@ -122,10 +161,10 @@ printf 'integration_%s_ok\\n' '$mode'
 run_container_test new
 run_container_test existing
 
-docker run --rm -v "$ROOT:/repo:ro" "$IMAGE" bash -lc '
+"${DOCKER_RUN[@]}" -v "$ROOT:/repo:ro" "$IMAGE" bash -lc '
 set -Eeuo pipefail
 apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sudo >/dev/null
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sudo python3 >/dev/null
 adduser --disabled-password --gecos "" guardian >/dev/null
 
 baseline_helper=4a1d6c53954b5b88f5a7c01821377142f1e998dc37ac388a4e74d40729282e08
@@ -136,6 +175,8 @@ baseline_v3_helper=699c1c32b3397cd43302fe3a1a14ec3360e7f95427df8452f8735e61b1821
 baseline_v3_sudoers=3580b0d94eb24be1d5a18cab2e6bc40e83c7ec1c09c8fc552f97c595ab131341
 baseline_v4_helper=42dbb4c4146cbb323fa807a7f35ca6e813d4af03bda027f5f2de9f4c5f1a2169
 baseline_v4_sudoers=37a03d5d96f9a149acc42240068bf7ddcc3ec766fb13667f87812e289b3e0d76
+baseline_v5_helper=26a83ff99dfd63640b0a14d069fdeb0a8235b1c80fefa4d8168d6d3064084fbc
+baseline_v5_sudoers=d656075f924c9d5b047fa75c8072cdf99e399220b4e858fd435a36e492fb8004
 new_helper=$(sha256sum /repo/src/vds-guardianctl | cut -d" " -f1)
 new_sudoers=$(sha256sum /repo/src/vds-guardian.sudoers | cut -d" " -f1)
 
@@ -169,6 +210,14 @@ install_baseline_v4() {
   install -o root -g root -m 0440 /repo/tests/fixtures/vds-guardian.sudoers-16db836 /etc/sudoers.d/vds-guardian
   test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline_v4_helper"
   test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$baseline_v4_sudoers"
+}
+
+install_baseline_v5() {
+  rm -f /usr/local/sbin/vds-guardianctl /etc/sudoers.d/vds-guardian
+  install -o root -g root -m 0755 /repo/tests/fixtures/vds-guardianctl-304d084 /usr/local/sbin/vds-guardianctl
+  install -o root -g root -m 0440 /repo/tests/fixtures/vds-guardian.sudoers-304d084 /etc/sudoers.d/vds-guardian
+  test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline_v5_helper"
+  test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$baseline_v5_sudoers"
 }
 
 install_baseline
@@ -242,7 +291,13 @@ bash /repo/dist/upgrade-existing.sh >/tmp/upgrade-idempotent.log
 test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$new_helper"
 test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$new_sudoers"
 
-# The currently deployed published pair upgrades successfully.
+# The exact 304d084 pair upgrades successfully.
+install_baseline_v5
+bash /repo/dist/upgrade-existing.sh >/tmp/upgrade-v5.log
+test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$new_helper"
+test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$new_sudoers"
+
+# The preceding deployed published pair upgrades successfully.
 install_baseline_v4
 bash /repo/dist/upgrade-existing.sh >/tmp/upgrade-v4.log
 test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$new_helper"
@@ -278,6 +333,15 @@ fi
 test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline_v4_helper"
 test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$baseline_v3_sudoers"
 
+install_baseline_v5
+install -o root -g root -m 0440 /repo/tests/fixtures/vds-guardian.sudoers-16db836 /etc/sudoers.d/vds-guardian
+if bash /repo/dist/upgrade-existing.sh >/tmp/mixed-baseline-v5.log 2>&1; then
+  echo "upgrade accepted a mixed V5 baseline pair" >&2
+  exit 83
+fi
+test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline_v5_helper"
+test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$baseline_v4_sudoers"
+
 # Either member drifting from the exact baseline rejects the whole upgrade.
 install_baseline
 printf "# drift\n" >>/usr/local/sbin/vds-guardianctl
@@ -300,8 +364,8 @@ test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline
 test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$drifted_sudoers"
 
 # Force the post-install visudo check to fail after both files were installed.
-# The ERR rollback must restore both baseline files, including exact modes.
-install_baseline
+# The ERR rollback must restore the exact V5 files, including exact modes.
+install_baseline_v5
 mv /usr/sbin/visudo /usr/sbin/visudo.real
 printf "%s\n" \
   "#!/bin/bash" \
@@ -316,8 +380,8 @@ if bash /repo/dist/upgrade-existing.sh >/tmp/late-failure.log 2>&1; then
   echo "upgrade unexpectedly survived artificial late failure" >&2
   exit 73
 fi
-test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline_helper"
-test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$baseline_sudoers"
+test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline_v5_helper"
+test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$baseline_v5_sudoers"
 test "$(stat -c "%U:%G %a" /usr/local/sbin/vds-guardianctl)" = "root:root 755"
 test "$(stat -c "%U:%G %a" /etc/sudoers.d/vds-guardian)" = "root:root 440"
 /usr/sbin/visudo.real -cf /etc/sudoers.d/vds-guardian >/dev/null
@@ -327,7 +391,7 @@ test "$(cat /tmp/visudo-count)" = 3
 # If rollback validation itself fails, restoration is still attempted for both
 # leaves, the result remains non-zero, and operators receive a machine-greppable
 # CRITICAL diagnostic. Calls: embedded=1, post-install=2, rollback=3.
-install_baseline
+install_baseline_v5
 printf "%s\n" \
   "#!/bin/bash" \
   "count=0" \
@@ -342,17 +406,17 @@ if bash /repo/dist/upgrade-existing.sh >/tmp/rollback-validation-failure.log 2>&
   exit 78
 fi
 grep -Fq "CRITICAL: restored sudoers failed metadata, hash, or visudo verification" /tmp/rollback-validation-failure.log
-test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline_helper"
-test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$baseline_sudoers"
+test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline_v5_helper"
+test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$baseline_v5_sudoers"
 test "$(stat -c "%U:%G %a" /usr/local/sbin/vds-guardianctl)" = "root:root 755"
 test "$(stat -c "%U:%G %a" /etc/sudoers.d/vds-guardian)" = "root:root 440"
 printf "%s\n" "upgrade_existing_lock_boundaries_identity_and_verified_rollback_ok"
 '
 
-docker run --rm -v "$ROOT:/repo:ro" "$IMAGE" bash -lc '
+"${DOCKER_RUN[@]}" -v "$ROOT:/repo:ro" "$IMAGE" bash -lc '
 set -Eeuo pipefail
 apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sudo openssh-client >/dev/null
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sudo python3 openssh-client >/dev/null
 adduser --disabled-password --gecos "" guardian >/dev/null
 groupadd disk-test
 usermod -aG disk-test guardian
@@ -365,10 +429,10 @@ test ! -e /etc/sudoers.d/vds-guardian
 printf "%s\n" "unexpected_existing_group_rejected"
 '
 
-docker run --rm -v "$ROOT:/repo:ro" "$IMAGE" bash -lc '
+"${DOCKER_RUN[@]}" -v "$ROOT:/repo:ro" "$IMAGE" bash -lc '
 set -Eeuo pipefail
 apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sudo openssh-client >/dev/null
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sudo python3 openssh-client >/dev/null
 groupadd docker
 printf "%s\n" "ADD_EXTRA_GROUPS=1" "EXTRA_GROUPS=\"docker\"" >>/etc/adduser.conf
 ssh-keygen -q -t ed25519 -N "" -f /tmp/test_guardian_key
@@ -389,10 +453,10 @@ test ! -e /etc/sudoers.d/vds-guardian
 printf "%s\n" "unexpected_new_group_rejected_and_rolled_back"
 '
 
-docker run --rm -v "$ROOT:/repo:ro" "$IMAGE" bash -lc '
+"${DOCKER_RUN[@]}" -v "$ROOT:/repo:ro" "$IMAGE" bash -lc '
 set -Eeuo pipefail
 apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sudo openssh-client >/dev/null
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sudo python3 openssh-client >/dev/null
 ssh-keygen -q -t ed25519 -N "" -f /tmp/test_guardian_key
 public_key=$(cat /tmp/test_guardian_key.pub)
 if bash /repo/dist/install-new.sh --public-key "$public_key" >/tmp/missing-token.log 2>&1; then
@@ -437,10 +501,10 @@ test ! -e /etc/sudoers.d/vds-guardian
 printf "%s\n" "invalid_enrollment_tokens_rejected"
 '
 
-docker run --rm -v "$ROOT:/repo:ro" "$IMAGE" bash -lc '
+"${DOCKER_RUN[@]}" -v "$ROOT:/repo:ro" "$IMAGE" bash -lc '
 set -Eeuo pipefail
 apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sudo openssh-client >/dev/null
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sudo python3 openssh-client >/dev/null
 ssh-keygen -q -t ed25519 -N "" -f /tmp/test_guardian_key
 public_key=$(cat /tmp/test_guardian_key.pub)
 enrollment_token="vg1_0123456789abcdefghijklmnopqrstuvwxyz_A-BCDE"
@@ -459,10 +523,10 @@ test ! -e /etc/sudoers.d/vds-guardian
 printf "%s\n" "failed_install_rolled_back"
 '
 
-docker run --rm -v "$ROOT:/repo:ro" "$IMAGE" bash -lc '
+"${DOCKER_RUN[@]}" -v "$ROOT:/repo:ro" "$IMAGE" bash -lc '
 set -Eeuo pipefail
 apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sudo openssh-client >/dev/null
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sudo python3 openssh-client >/dev/null
 ssh-keygen -q -t ed25519 -N "" -f /tmp/test_guardian_key
 public_key=$(cat /tmp/test_guardian_key.pub)
 enrollment_token="vg1_0123456789abcdefghijklmnopqrstuvwxyz_A-BCDE"

@@ -30,9 +30,10 @@ mapfile -t enrollment_token_lines <"$enrollment_token_file"
 enrollment_token=${enrollment_token_lines[0]}
 [[ ${enrollment_token} =~ ^vg1_[A-Za-z0-9_-]{43}$ ]] || fail 'invalid enrollment token'
 
-for command in adduser userdel install stat visudo bash sudo ssh-keygen getent id mktemp wc rm; do
+for command in adduser userdel install stat visudo bash sudo ssh-keygen getent id mktemp wc rm sha256sum grep; do
   command -v "$command" >/dev/null 2>&1 || fail "required command is missing: $command"
 done
+[[ -x /usr/bin/python3 ]] || fail 'required interpreter is missing: /usr/bin/python3'
 
 hostname
 id
@@ -71,6 +72,10 @@ cat >"$tmpdir/vds-guardian.sudoers" <<'VDS_GUARDIAN_SUDOERS'
 __SUDOERS__
 VDS_GUARDIAN_SUDOERS
 
+[[ $(sha256sum -- "$tmpdir/vds-guardianctl") == '__NEW_HELPER_SHA256__  '"$tmpdir/vds-guardianctl" ]] || fail 'embedded helper hash mismatch'
+[[ $(sha256sum -- "$tmpdir/vds-guardian.sudoers") == '__NEW_SUDOERS_SHA256__  '"$tmpdir/vds-guardian.sudoers" ]] || fail 'embedded sudoers hash mismatch'
+grep -Fqx -- '# vds-guardianctl-sha256: __NEW_HELPER_SHA256__' "$tmpdir/vds-guardian.sudoers" || fail 'sudoers helper authority mismatch'
+
 printf '%s\n' "$public_key" >"$tmpdir/authorized_key"
 [[ $(wc -l <"$tmpdir/authorized_key") -eq 1 ]] || fail 'public key must be exactly one line'
 ssh-keygen -l -f "$tmpdir/authorized_key" >/dev/null 2>&1 || fail 'invalid SSH public key'
@@ -96,6 +101,8 @@ install -m 600 -o guardian -g guardian "$tmpdir/authorized_key" /home/guardian/.
 install -m 600 -o guardian -g guardian "$tmpdir/enrollment_token" /home/guardian/.vds-guardian-enrollment
 install -m 755 -o root -g root "$tmpdir/vds-guardianctl" /usr/local/sbin/vds-guardianctl
 install -m 440 -o root -g root "$tmpdir/vds-guardian.sudoers" /etc/sudoers.d/vds-guardian
+[[ $(sha256sum -- /usr/local/sbin/vds-guardianctl) == '__NEW_HELPER_SHA256__  /usr/local/sbin/vds-guardianctl' ]] || fail 'installed helper hash mismatch'
+[[ $(sha256sum -- /etc/sudoers.d/vds-guardian) == '__NEW_SUDOERS_SHA256__  /etc/sudoers.d/vds-guardian' ]] || fail 'installed sudoers hash mismatch'
 visudo -cf /etc/sudoers.d/vds-guardian
 stat -c '%U:%G %a %n' /home/guardian/.ssh /home/guardian/.ssh/authorized_keys /home/guardian/.vds-guardian-enrollment /usr/local/sbin/vds-guardianctl /etc/sudoers.d/vds-guardian
 id guardian

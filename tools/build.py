@@ -16,12 +16,17 @@ def build(template_name: str, output_name: str) -> pathlib.Path:
     template = (TEMPLATES / template_name).read_text(encoding="utf-8")
     helper = (SRC / "vds-guardianctl").read_text(encoding="utf-8").rstrip("\n")
     sudoers = (SRC / "vds-guardian.sudoers").read_text(encoding="utf-8").rstrip("\n")
+    helper_digest = hashlib.sha256((helper + "\n").encode("utf-8")).hexdigest()
+    authority = f"# vds-guardianctl-sha256: {helper_digest}"
+    if sudoers.splitlines().count(authority) != 1:
+        raise SystemExit("sudoers detached helper SHA-256 authority is missing or stale")
+    exact_verb = "/usr/local/sbin/vds-guardianctl audit-root-storage"
+    if sudoers.count(exact_verb) != 1 or exact_verb + " " in sudoers:
+        raise SystemExit("sudoers audit-root-storage command is not one exact no-argument verb")
     replacements = {
         "__HELPER__": helper,
         "__SUDOERS__": sudoers,
-        "__NEW_HELPER_SHA256__": hashlib.sha256(
-            (helper + "\n").encode("utf-8")
-        ).hexdigest(),
+        "__NEW_HELPER_SHA256__": helper_digest,
         "__NEW_SUDOERS_SHA256__": hashlib.sha256(
             (sudoers + "\n").encode("utf-8")
         ).hexdigest(),
