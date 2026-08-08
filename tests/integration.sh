@@ -38,6 +38,10 @@ if git -C "$ROOT" cat-file -e 304d084^{commit} 2>/dev/null; then
   cmp -s <(git -C "$ROOT" show 304d084:src/vds-guardianctl) "$ROOT/tests/fixtures/vds-guardianctl-304d084"
   cmp -s <(git -C "$ROOT" show 304d084:src/vds-guardian.sudoers) "$ROOT/tests/fixtures/vds-guardian.sudoers-304d084"
 fi
+if git -C "$ROOT" cat-file -e fc50008^{commit} 2>/dev/null; then
+  cmp -s <(git -C "$ROOT" show fc50008:src/vds-guardianctl) "$ROOT/tests/fixtures/vds-guardianctl-fc50008"
+  cmp -s <(git -C "$ROOT" show fc50008:src/vds-guardian.sudoers) "$ROOT/tests/fixtures/vds-guardian.sudoers-fc50008"
+fi
 
 # Inspection templates must select only reviewed metadata and must never dump
 # environment, label maps, config/secret contents, or volume mountpoints.
@@ -186,6 +190,8 @@ baseline_v4_helper=42dbb4c4146cbb323fa807a7f35ca6e813d4af03bda027f5f2de9f4c5f1a2
 baseline_v4_sudoers=37a03d5d96f9a149acc42240068bf7ddcc3ec766fb13667f87812e289b3e0d76
 baseline_v5_helper=26a83ff99dfd63640b0a14d069fdeb0a8235b1c80fefa4d8168d6d3064084fbc
 baseline_v5_sudoers=d656075f924c9d5b047fa75c8072cdf99e399220b4e858fd435a36e492fb8004
+baseline_v6_helper=1e01e3f0e10b0a900da09ac5485bf74a4cc9843a47cc2aea921372029d4b5aed
+baseline_v6_sudoers=7ce85ca65cd4cb384fd514aaad0d00eb8a1ffc50e2a288f07a33f99f0f14eb94
 new_helper=$(sha256sum /repo/src/vds-guardianctl | cut -d" " -f1)
 new_sudoers=$(sha256sum /repo/src/vds-guardian.sudoers | cut -d" " -f1)
 
@@ -227,6 +233,14 @@ install_baseline_v5() {
   install -o root -g root -m 0440 /repo/tests/fixtures/vds-guardian.sudoers-304d084 /etc/sudoers.d/vds-guardian
   test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline_v5_helper"
   test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$baseline_v5_sudoers"
+}
+
+install_baseline_v6() {
+  rm -f /usr/local/sbin/vds-guardianctl /etc/sudoers.d/vds-guardian
+  install -o root -g root -m 0755 /repo/tests/fixtures/vds-guardianctl-fc50008 /usr/local/sbin/vds-guardianctl
+  install -o root -g root -m 0440 /repo/tests/fixtures/vds-guardian.sudoers-fc50008 /etc/sudoers.d/vds-guardian
+  test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline_v6_helper"
+  test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$baseline_v6_sudoers"
 }
 
 install_baseline
@@ -300,6 +314,12 @@ bash /repo/dist/upgrade-existing.sh >/tmp/upgrade-idempotent.log
 test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$new_helper"
 test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$new_sudoers"
 
+# The exact current production pair from fc50008 upgrades successfully.
+install_baseline_v6
+bash /repo/dist/upgrade-existing.sh >/tmp/upgrade-v6.log
+test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$new_helper"
+test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$new_sudoers"
+
 # The exact 304d084 pair upgrades successfully.
 install_baseline_v5
 bash /repo/dist/upgrade-existing.sh >/tmp/upgrade-v5.log
@@ -351,6 +371,15 @@ fi
 test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline_v5_helper"
 test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$baseline_v4_sudoers"
 
+install_baseline_v6
+install -o root -g root -m 0440 /repo/tests/fixtures/vds-guardian.sudoers-304d084 /etc/sudoers.d/vds-guardian
+if bash /repo/dist/upgrade-existing.sh >/tmp/mixed-baseline-v6.log 2>&1; then
+  echo "upgrade accepted a mixed V6 baseline pair" >&2
+  exit 84
+fi
+test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline_v6_helper"
+test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$baseline_v5_sudoers"
+
 # Either member drifting from the exact baseline rejects the whole upgrade.
 install_baseline
 printf "# drift\n" >>/usr/local/sbin/vds-guardianctl
@@ -373,8 +402,8 @@ test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline
 test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$drifted_sudoers"
 
 # Force the post-install visudo check to fail after both files were installed.
-# The ERR rollback must restore the exact V5 files, including exact modes.
-install_baseline_v5
+# The ERR rollback must restore the exact V6 files, including exact modes.
+install_baseline_v6
 mv /usr/sbin/visudo /usr/sbin/visudo.real
 printf "%s\n" \
   "#!/bin/bash" \
@@ -389,8 +418,8 @@ if bash /repo/dist/upgrade-existing.sh >/tmp/late-failure.log 2>&1; then
   echo "upgrade unexpectedly survived artificial late failure" >&2
   exit 73
 fi
-test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline_v5_helper"
-test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$baseline_v5_sudoers"
+test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline_v6_helper"
+test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$baseline_v6_sudoers"
 test "$(stat -c "%U:%G %a" /usr/local/sbin/vds-guardianctl)" = "root:root 755"
 test "$(stat -c "%U:%G %a" /etc/sudoers.d/vds-guardian)" = "root:root 440"
 /usr/sbin/visudo.real -cf /etc/sudoers.d/vds-guardian >/dev/null
@@ -400,7 +429,7 @@ test "$(cat /tmp/visudo-count)" = 3
 # If rollback validation itself fails, restoration is still attempted for both
 # leaves, the result remains non-zero, and operators receive a machine-greppable
 # CRITICAL diagnostic. Calls: embedded=1, post-install=2, rollback=3.
-install_baseline_v5
+install_baseline_v6
 printf "%s\n" \
   "#!/bin/bash" \
   "count=0" \
@@ -415,8 +444,8 @@ if bash /repo/dist/upgrade-existing.sh >/tmp/rollback-validation-failure.log 2>&
   exit 78
 fi
 grep -Fq "CRITICAL: restored sudoers failed metadata, hash, or visudo verification" /tmp/rollback-validation-failure.log
-test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline_v5_helper"
-test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$baseline_v5_sudoers"
+test "$(sha256sum /usr/local/sbin/vds-guardianctl | cut -d" " -f1)" = "$baseline_v6_helper"
+test "$(sha256sum /etc/sudoers.d/vds-guardian | cut -d" " -f1)" = "$baseline_v6_sudoers"
 test "$(stat -c "%U:%G %a" /usr/local/sbin/vds-guardianctl)" = "root:root 755"
 test "$(stat -c "%U:%G %a" /etc/sudoers.d/vds-guardian)" = "root:root 440"
 printf "%s\n" "upgrade_existing_lock_boundaries_identity_and_verified_rollback_ok"

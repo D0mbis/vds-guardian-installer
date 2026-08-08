@@ -3,211 +3,6 @@ set -Eeuo pipefail
 PATH='/usr/sbin:/usr/bin:/sbin:/bin'
 umask 077
 export LC_ALL=C
-
-readonly HELPER_PATH='/usr/local/sbin/vds-guardianctl'
-readonly SUDOERS_PATH='/etc/sudoers.d/vds-guardian'
-readonly LOCK_PATH='/run/vds-guardian-upgrade.lock'
-readonly BASELINE_V1_HELPER_SHA256='4a1d6c53954b5b88f5a7c01821377142f1e998dc37ac388a4e74d40729282e08'
-readonly BASELINE_V1_SUDOERS_SHA256='125a74e6ffa5c50d3fecf8142cc7c5a1de3017e455a1c91f87e6f298c8309020'
-readonly BASELINE_V2_HELPER_SHA256='7c2fe0ed76f2811b9905f1f975c1e8de526313c9466bfb32fd229a7e696e46ae'
-readonly BASELINE_V2_SUDOERS_SHA256='3580b0d94eb24be1d5a18cab2e6bc40e83c7ec1c09c8fc552f97c595ab131341'
-readonly BASELINE_V3_HELPER_SHA256='699c1c32b3397cd43302fe3a1a14ec3360e7f95427df8452f8735e61b182117d'
-readonly BASELINE_V3_SUDOERS_SHA256='3580b0d94eb24be1d5a18cab2e6bc40e83c7ec1c09c8fc552f97c595ab131341'
-readonly BASELINE_V4_HELPER_SHA256='42dbb4c4146cbb323fa807a7f35ca6e813d4af03bda027f5f2de9f4c5f1a2169'
-readonly BASELINE_V4_SUDOERS_SHA256='37a03d5d96f9a149acc42240068bf7ddcc3ec766fb13667f87812e289b3e0d76'
-# Exact source pair from commit 304d084 (fixtures vds-guardian{ctl,.sudoers}-304d084).
-readonly BASELINE_V5_HELPER_SHA256='26a83ff99dfd63640b0a14d069fdeb0a8235b1c80fefa4d8168d6d3064084fbc'
-readonly BASELINE_V5_SUDOERS_SHA256='d656075f924c9d5b047fa75c8072cdf99e399220b4e858fd435a36e492fb8004'
-# Exact source pair from commit fc50008 (fixtures vds-guardian{ctl,.sudoers}-fc50008).
-readonly BASELINE_V6_HELPER_SHA256='1e01e3f0e10b0a900da09ac5485bf74a4cc9843a47cc2aea921372029d4b5aed'
-readonly BASELINE_V6_SUDOERS_SHA256='7ce85ca65cd4cb384fd514aaad0d00eb8a1ffc50e2a288f07a33f99f0f14eb94'
-readonly NEW_HELPER_SHA256='dc4a0cdff43ce5d282e399b2d833a985312eb8f92af5b26ced90ebad5ad4a60d'
-readonly NEW_SUDOERS_SHA256='4a3935103d445b7f8da04f72563fce3db0b25f00bcbfef661d6fef7d9f533198'
-
-fail() {
-  printf 'ERROR: %s\n' "$*" >&2
-  exit 1
-}
-
-[[ ${EUID} -eq 0 ]] || fail 'run this upgrade as root (for example: sudo bash upgrade-existing.sh)'
-[[ $# -eq 0 ]] || fail 'this upgrade accepts no arguments'
-
-for command in bash cat cmp flock getent id install mktemp mv rm sha256sum stat visudo; do
-  command -v "$command" >/dev/null 2>&1 || fail "required command is missing: $command"
-done
-[[ -x /usr/bin/python3 ]] || fail 'required interpreter is missing: /usr/bin/python3'
-
-safe_dir() {
-  local path=$1 metadata uid gid mode type mode_number
-  [[ -d ${path} && ! -L ${path} ]] || return 1
-  metadata=$(stat -c '%u:%g:%a:%F' -- "$path") || return 1
-  IFS=: read -r uid gid mode type <<<"$metadata"
-  [[ $uid == 0 && $gid == 0 && $type == directory ]] || return 1
-  mode_number=$((8#$mode))
-  (( (mode_number & 0022) == 0 ))
-}
-
-require_safe_dir() {
-  safe_dir "$1" || fail "required parent is not a real root:root non-group/world-writable directory: $1"
-}
-
-safe_file() {
-  local path=$1 expected_mode=$2 metadata
-  [[ -f ${path} && ! -L ${path} ]] || return 1
-  metadata=$(stat -c '%u:%g:%a:%F' -- "$path") || return 1
-  [[ ${metadata} == "0:0:${expected_mode}:regular file" ]]
-}
-
-require_safe_file() {
-  safe_file "$1" "$2" || fail "unsafe owner, mode, or type for required path: $1"
-}
-
-file_sha256() {
-  local output
-  output=$(sha256sum -- "$1") || fail "cannot hash file: $1"
-  printf '%s\n' "${output%% *}"
-}
-
-require_helper_authority() {
-  local helper=$1 sudoers=$2 digest
-  digest=$(file_sha256 "$helper")
-  grep -Fqx -- "# vds-guardianctl-sha256: $digest" "$sudoers" \
-    || fail 'sudoers detached helper hash authority does not match helper'
-}
-
-require_all_parents() {
-  local parent
-  for parent in / /usr /usr/local /usr/local/sbin /etc /etc/sudoers.d; do
-    require_safe_dir "$parent"
-  done
-}
-
-require_installed_state() {
-  local expected_helper=$1 expected_sudoers=$2
-  require_all_parents
-  require_safe_file "$HELPER_PATH" 755
-  require_safe_file "$SUDOERS_PATH" 440
-  [[ $(file_sha256 "$HELPER_PATH") == "$expected_helper" ]] || fail 'installed helper hash changed'
-  [[ $(file_sha256 "$SUDOERS_PATH") == "$expected_sudoers" ]] || fail 'installed sudoers hash changed'
-  if [[ $expected_helper == "$NEW_HELPER_SHA256" ]]; then
-    require_helper_authority "$HELPER_PATH" "$SUDOERS_PATH"
-  fi
-}
-
-# Validate the lock boundary before opening. / and /run are root-only writable,
-# so an unprivileged process cannot race this check by replacing the fixed lock
-# leaf or its path components.
-require_safe_dir /
-require_safe_dir /run
-[[ ! -L $LOCK_PATH ]] || fail "upgrade lock must not be a symlink: $LOCK_PATH"
-exec {lock_fd}>>"$LOCK_PATH" || fail "cannot open upgrade lock: $LOCK_PATH"
-require_safe_dir /run
-[[ -f $LOCK_PATH && ! -L $LOCK_PATH ]] || fail "upgrade lock is not a regular non-symlink file: $LOCK_PATH"
-lock_metadata=$(stat -c '%u:%g:%a' -- "$LOCK_PATH") || fail 'cannot inspect upgrade lock'
-IFS=: read -r lock_uid lock_gid lock_mode <<<"$lock_metadata"
-lock_mode_number=$((8#$lock_mode))
-[[ $lock_uid == 0 && $lock_gid == 0 ]] \
-  || fail 'upgrade lock has unsafe owner'
-(( (lock_mode_number & 0022) == 0 )) || fail 'upgrade lock is group/world writable'
-flock -n "$lock_fd" || fail 'another guardian upgrade is already running'
-
-# Nothing below inspects or hashes either target until this process owns the
-# exclusive lock. The descriptor remains open through EXIT cleanup.
-require_all_parents
-require_safe_file "$HELPER_PATH" 755
-require_safe_file "$SUDOERS_PATH" 440
-current_helper_sha256=$(file_sha256 "$HELPER_PATH")
-current_sudoers_sha256=$(file_sha256 "$SUDOERS_PATH")
-selected_baseline_helper_sha256=''
-selected_baseline_sudoers_sha256=''
-
-getent passwd guardian >/dev/null || fail 'guardian account does not exist'
-guardian_uid=$(id -u guardian) || fail 'cannot determine guardian uid'
-[[ $guardian_uid != 0 ]] || fail 'guardian must not have uid 0'
-guardian_primary_gid=$(id -g guardian) || fail 'cannot determine guardian primary gid'
-[[ $guardian_primary_gid != 0 ]] || fail 'guardian must not have primary gid 0'
-guardian_numeric_groups=$(id -G guardian) || fail 'cannot determine guardian numeric groups'
-for group_id in $guardian_numeric_groups; do
-  [[ $group_id != 0 ]] || fail 'guardian must not belong to numeric group 0'
-done
-guardian_groups=$(id -nG guardian) || fail 'cannot determine guardian groups'
-[[ -n ${guardian_groups} ]] || fail 'guardian group list is empty'
-for group in $guardian_groups; do
-  case "$group" in
-    guardian|users) ;;
-    *) fail "guardian has an unexpected supplemental group: $group" ;;
-  esac
-done
-
-tmpdir=$(mktemp -d)
-mutation_started=0
-committed=0
-rollback_done=0
-
-atomic_replace() {
-  local source=$1 destination=$2 mode=$3 parent stage
-  parent=${destination%/*}
-  safe_dir "$parent" || return 1
-  stage=$(mktemp "$parent/.vds-guardian-upgrade.XXXXXX") || return 1
-  if ! install -m "$mode" -o root -g root -- "$source" "$stage"; then
-    rm -f -- "$stage"
-    return 1
-  fi
-  if ! safe_file "$stage" "${mode#0}"; then
-    rm -f -- "$stage"
-    return 1
-  fi
-  safe_dir "$parent" || { rm -f -- "$stage"; return 1; }
-  mv -T -- "$stage" "$destination" || { rm -f -- "$stage"; return 1; }
-}
-
-rollback_and_verify() {
-  local failed=0
-  rollback_done=1
-  printf '%s\n' 'ERROR: upgrade failed; restoring both original files' >&2
-  atomic_replace "$tmpdir/original-helper" "$HELPER_PATH" 0755 \
-    || { printf '%s\n' 'CRITICAL: failed to restore original helper' >&2; failed=1; }
-  atomic_replace "$tmpdir/original-sudoers" "$SUDOERS_PATH" 0440 \
-    || { printf '%s\n' 'CRITICAL: failed to restore original sudoers file' >&2; failed=1; }
-
-  if ! safe_file "$HELPER_PATH" 755 \
-    || [[ $(sha256sum -- "$HELPER_PATH" 2>/dev/null) != "$selected_baseline_helper_sha256  $HELPER_PATH" ]] \
-    || ! bash -n "$HELPER_PATH"; then
-    printf '%s\n' 'CRITICAL: restored helper failed metadata, hash, or syntax verification' >&2
-    failed=1
-  fi
-  if ! safe_file "$SUDOERS_PATH" 440 \
-    || [[ $(sha256sum -- "$SUDOERS_PATH" 2>/dev/null) != "$selected_baseline_sudoers_sha256  $SUDOERS_PATH" ]] \
-    || ! visudo -cf "$SUDOERS_PATH"; then
-    printf '%s\n' 'CRITICAL: restored sudoers failed metadata, hash, or visudo verification' >&2
-    failed=1
-  fi
-  return "$failed"
-}
-
-cleanup() {
-  local status=$? rollback_status=0
-  trap - EXIT INT TERM HUP
-  if [[ ${mutation_started} -eq 1 && ${committed} -eq 0 && ${rollback_done} -eq 0 ]]; then
-    rollback_and_verify || rollback_status=$?
-  fi
-  rm -rf -- "$tmpdir" || { printf '%s\n' 'CRITICAL: failed to remove upgrade temporary directory' >&2; rollback_status=1; }
-  if (( status == 0 && rollback_status != 0 )); then
-    status=1
-  fi
-  exit "$status"
-}
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-trap 'exit 129' HUP
-
-cat >"$tmpdir/new-helper" <<'VDS_GUARDIAN_HELPER'
-#!/bin/bash
-set -Eeuo pipefail
-PATH='/usr/sbin:/usr/bin:/sbin:/bin'
-umask 077
-export LC_ALL=C
 export HOME='/root'
 export USER='root'
 export LOGNAME='root'
@@ -344,16 +139,11 @@ audit_root_storage() {
   /usr/bin/python3 - <<'PY'
 import datetime,fcntl,hashlib,io,os,re,stat,sys,time
 ROOT=b'/root'; DIR=os.O_RDONLY|os.O_CLOEXEC|os.O_DIRECTORY|os.O_NOFOLLOW; FILE=os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW
-SUBTREE_MAX_ENTRIES=250000; GLOBAL_MAX_ENTRIES=500000; MAX_DEPTH=64; MAX_SECONDS=120; MAX_REPORT=8388608; TOP_N=64; LIST_MAX=50
+MAX_ENTRIES=500000; MAX_DEPTH=64; MAX_SECONDS=120; MAX_REPORT=8388608
 AUTH=re.compile(rb'^# vds-guardianctl-sha256: ([0-9a-f]{64})$')
 SENSITIVE=re.compile(rb'(?:^\.|secret|token|pass(?:word)?|credential|private|auth|cookie|session|mnemonic|wallet|vault|seed|api[-_.]?key|ssh|gnupg|kubeconfig|id_(?:rsa|dsa|ecdsa|ed25519)|service[-_.]?account|\.env(?:\.|$)|(?:^|[-_.])(?:key|pem|p12|pfx|keystore)(?:[-_.]|$))',re.I)
 CATEGORIES=('cache','backups','Git','logs','temp')
 class Bad(Exception):pass
-class SubtreeLimit(Exception):pass
-class GlobalLimit(Exception):
- def __init__(self,reason):
-  self.reason=reason;Exception.__init__(self,reason)
-class DepthLimit(Exception):pass
 def bad(s):raise Bad(s)
 def metadata(s,d,m=None):
  return s.st_uid==s.st_gid==0 and ((stat.S_ISDIR(s.st_mode) and not s.st_mode&0o022) if d else (stat.S_ISREG(s.st_mode) and stat.S_IMODE(s.st_mode)==m))
@@ -449,121 +239,64 @@ def ftype(m):
 def mtime(s):
  try:return datetime.datetime.fromtimestamp(s.st_mtime_ns//1000000000,datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
  except (OverflowError,OSError,ValueError):bad('unrepresentable object mtime')
-def add_reason(current,new):
- return '+'.join(dict.fromkeys(filter(None,(current+'+'+new).split('+'))))
 class Scanner:
  def __init__(self,m,d):
-  self.mounts=m;self.dev=d;self.count=0;self.sub_count=0;self.sub_exhausted=False;self.global_stop=False;self.stop_reason=''
-  self.deadline=time.monotonic()+MAX_SECONDS;self.totals={x:0 for x in CATEGORIES};self.files=set();self.category_files={x:set() for x in CATEGORIES}
+  self.mounts=m;self.dev=d;self.count=0;self.deadline=time.monotonic()+MAX_SECONDS;self.totals={x:0 for x in CATEGORIES};self.files=set();self.category_files={x:set() for x in CATEGORIES}
  def check(self):
-  if time.monotonic()>self.deadline:raise GlobalLimit('time_limit')
- def reserve_global(self):
-  self.count+=1
-  if self.count>GLOBAL_MAX_ENTRIES:raise GlobalLimit('entry_limit')
-  self.check()
- def reserve_sub(self):
-  self.sub_count+=1;self.count+=1
-  if self.sub_count>SUBTREE_MAX_ENTRIES:raise SubtreeLimit()
-  if self.count>GLOBAL_MAX_ENTRIES:raise GlobalLimit('entry_limit')
-  self.check()
+  if self.count>MAX_ENTRIES:bad('root storage audit entry limit exceeded')
+  if time.monotonic()>self.deadline:bad('root storage audit time limit exceeded')
+ def reserve(self):
+  self.count+=1;self.check()
  def node(self,fd,n,path,label,depth,active):
   self.check()
-  if depth>MAX_DEPTH:raise DepthLimit()
-  if path in self.mounts and path!=ROOT:return {'excluded':'mount'}
+  if depth>MAX_DEPTH:bad('root storage audit depth limit exceeded')
+  if time.monotonic()>self.deadline:bad('root storage audit time limit exceeded')
+  if path in self.mounts and path!=ROOT:return None
   try:s=os.stat(n,dir_fd=fd,follow_symlinks=False)
   except OSError:bad('object metadata read failed')
   if s.st_dev!=self.dev:bad('object crossed an unrecorded mount boundary')
-  active=set(active)|categories(n);allocated=s.st_blocks*512
+  active=set(active)|categories(n);children=[];allocated=s.st_blocks*512
   key=(s.st_dev,s.st_ino) if stat.S_ISREG(s.st_mode) else None
   if key is not None:
    if key in self.files:allocated=0
    else:self.files.add(key)
-  total=allocated;status='complete';reason=''
+  total=allocated
   if stat.S_ISDIR(s.st_mode):
    try:c=os.open(n,DIR,dir_fd=fd)
    except OSError:bad('directory open failed')
    try:
     a=os.fstat(c)
     if (a.st_dev,a.st_ino,a.st_mode)!=(s.st_dev,s.st_ino,s.st_mode):bad('directory changed during traversal')
-    ns=names(c,self.reserve_sub,self.check)
+    ns=names(c,self.reserve,self.check)
     if b'.git' in ns:active.add('Git')
     for cn in ns:
      child=self.node(c,cn,path+b'/'+cn,label+'/'+shown(cn),depth+1,active)
-     if child is None:continue
-     if child.get('excluded')=='mount':
-      status='partial';reason=add_reason(reason,'mount')
-      continue
-     total+=child['size']
-     if child['status']=='partial':
-      status='partial';reason=add_reason(reason,child['reason'])
-     if self.sub_exhausted or self.global_stop:break
-   except SubtreeLimit:
-    status='partial';reason=add_reason(reason,'entry_limit');self.sub_exhausted=True
-   except DepthLimit:
-    status='partial';reason=add_reason(reason,'depth_limit')
-   except GlobalLimit as e:
-    status='partial';reason=add_reason(reason,'global_'+e.reason);self.global_stop=True;self.stop_reason=e.reason
+     if child is not None:
+      total+=child['size']
+      if depth<2:children.append(child)
    finally:os.close(c)
   for x in active:
    if key is None:self.totals[x]+=s.st_blocks*512
    elif key not in self.category_files[x]:self.category_files[x].add(key);self.totals[x]+=s.st_blocks*512
-  return {'path':label,'size':total,'status':status,'reason':reason,'owner':'%d:%d'%(s.st_uid,s.st_gid),'mode':'0%o'%stat.S_IMODE(s.st_mode),'type':ftype(s.st_mode),'mtime':mtime(s)}
-def line(n):
- size_key='size_lower_bound' if n['status']=='partial' else 'size'
- s='path=%s %s=%d status=%s owner=%s mode=%s type=%s mtime=%s'%(n['path'],size_key,n['size'],n['status'],n['owner'],n['mode'],n['type'],n['mtime'])
- if n['status']=='partial':s+=' reason=%s entries=%d'%(n['reason'],n['entries'])
- return s+'\n'
-def audit(fd,mounts):
- sc=Scanner(mounts,os.fstat(fd).st_dev);completed=[];partials=[];excluded=[];not_audited=[]
- try:
-  top=names(fd,sc.reserve_global,sc.check)
- except GlobalLimit as e:
-  sc.global_stop=True;sc.stop_reason=e.reason;top=[]
- for n in top:
-  if sc.global_stop:
-   not_audited.append('/root/'+shown(n));continue
-  sc.sub_count=0;sc.sub_exhausted=False
-  try:
-   x=sc.node(fd,n,ROOT+b'/'+n,'/root/'+shown(n),1,set())
-  except GlobalLimit as e:
-   sc.global_stop=True;sc.stop_reason=e.reason
-   not_audited.append('/root/'+shown(n));continue
-  if x is None:continue
-  if x.get('excluded')=='mount':
-   excluded.append({'path':'/root/'+shown(n),'reason':'mount'});continue
-  if x['status']=='partial':
-   x['entries']=sc.sub_count;partials.append(x)
-  else:completed.append(x)
- out=io.StringIO()
- out.write('audit=root-storage progressive=1 limits subtree=%d global=%d depth=%d top=%d\n'%(SUBTREE_MAX_ENTRIES,GLOBAL_MAX_ENTRIES,MAX_DEPTH,TOP_N))
- # When the global budget or deadline expires before top-level enumeration
- # completes, the number of unvisited top-level subtrees is unknown, so the
- # summary reports the literal sentinel 'unbounded' instead of a fake count.
- na='unbounded' if (sc.global_stop and not top) else str(len(not_audited))
- out.write('summary completed=%d partial=%d excluded=%d not_audited=%s entries=%d\n'%(len(completed),len(partials),len(excluded),na,sc.count))
- if sc.global_stop:out.write('limit=%s\n'%sc.stop_reason)
- completed.sort(key=lambda x:x['size'],reverse=True)
- for x in completed[:TOP_N]:out.write(line(x))
- partials.sort(key=lambda x:x['size'],reverse=True)
- for x in partials[:LIST_MAX]:out.write(line(x))
- if len(partials)>LIST_MAX:out.write('partial_more=%d\n'%(len(partials)-LIST_MAX))
- for x in excluded[:LIST_MAX]:out.write('excluded path=%s reason=mount\n'%x['path'])
- if len(excluded)>LIST_MAX:out.write('excluded_more=%d\n'%(len(excluded)-LIST_MAX))
- for p in not_audited[:LIST_MAX]:out.write('not_audited path=%s\n'%p)
- if len(not_audited)>LIST_MAX:out.write('not_audited_more=%d\n'%(len(not_audited)-LIST_MAX))
- cat_status='complete' if (not partials and not excluded and not not_audited and not sc.global_stop) else 'partial'
- cat_size_key='size' if cat_status=='complete' else 'size_lower_bound'
- for c in CATEGORIES:out.write('category=%s %s=%d status=%s\n'%(c,cat_size_key,sc.totals[c],cat_status))
- data=out.getvalue().encode('ascii')
- if len(data)>MAX_REPORT:bad('root storage audit output limit exceeded')
- return data
+  return {'path':label,'size':total,'owner':'%d:%d'%(s.st_uid,s.st_gid),'mode':'0%o'%stat.S_IMODE(s.st_mode),'type':ftype(s.st_mode),'mtime':mtime(s),'children':children}
+def line(n):return 'path={path} size={size} owner={owner} mode={mode} type={type} mtime={mtime}\n'.format(**n)
 def main():
  if os.geteuid()!=0:bad('must run through the approved sudo rule')
  precheck();lf=lock();rf=[]
  try:
-  mp,mi=mounts();rf=chain([b'root']);data=audit(rf[-1],mp)
+  mp,mi=mounts();rf=chain([b'root']);sc=Scanner(mp,os.fstat(rf[-1]).st_dev);records=[]
+  for n in names(rf[-1],sc.reserve,sc.check):
+   x=sc.node(rf[-1],n,ROOT+b'/'+n,'/root/'+shown(n),1,set())
+   if x is not None:records.append(x)
   mp2,mi2=mounts()
   if mp2!=mp or mi2!=mi:bad('mount boundary inventory changed during audit')
+  out=io.StringIO()
+  for n in records:
+   out.write(line(n))
+   for c in n['children']:out.write(line(c))
+  for c in CATEGORIES:out.write('category=%s size=%d\n'%(c,sc.totals[c]))
+  data=out.getvalue().encode('ascii')
+  if len(data)>MAX_REPORT:bad('root storage audit output limit exceeded')
   while data:data=data[os.write(1,data):]
  finally:
   for x in reversed(rf):os.close(x)
@@ -1082,83 +815,3 @@ case "$1" in
   remove-containers-preserve-data) manifest_mutation remove /home/guardian/.vds-guardian/remove-containers.json ;;
   *) fail 'action is not allowlisted' ;;
 esac
-VDS_GUARDIAN_HELPER
-
-cat >"$tmpdir/new-sudoers" <<'VDS_GUARDIAN_SUDOERS'
-# Managed capability boundary for the vds-guardian Hermes profile.
-# Every allowed command has fixed arguments; no wildcard or arbitrary path is permitted.
-# vds-guardianctl-sha256: dc4a0cdff43ce5d282e399b2d833a985312eb8f92af5b26ced90ebad5ad4a60d
-Cmnd_Alias VDS_GUARDIAN_AUDIT = /usr/local/sbin/vds-guardianctl audit-compose-projects, /usr/local/sbin/vds-guardianctl audit-root-storage, /usr/local/sbin/vds-guardianctl audit-storage, /usr/local/sbin/vds-guardianctl audit-services, /usr/local/sbin/vds-guardianctl audit-security, /usr/local/sbin/vds-guardianctl verify-health
-Cmnd_Alias VDS_GUARDIAN_CLEAN = /usr/local/sbin/vds-guardianctl clean-apt-cache, /usr/local/sbin/vds-guardianctl vacuum-journal-30d, /usr/local/sbin/vds-guardianctl clean-tmpfiles, /usr/local/sbin/vds-guardianctl clean-docker-build-cache-30d
-Cmnd_Alias VDS_GUARDIAN_MANIFEST_MUTATE = /usr/local/sbin/vds-guardianctl purge-approved-compose-project, /usr/local/sbin/vds-guardianctl quiesce-approved-compose-project, /usr/local/sbin/vds-guardianctl remove-containers-preserve-data
-guardian ALL=(root) NOPASSWD: VDS_GUARDIAN_AUDIT, VDS_GUARDIAN_CLEAN, VDS_GUARDIAN_MANIFEST_MUTATE
-VDS_GUARDIAN_SUDOERS
-
-[[ $(file_sha256 "$tmpdir/new-helper") == "$NEW_HELPER_SHA256" ]] || fail 'embedded helper hash does not match the reviewed build'
-[[ $(file_sha256 "$tmpdir/new-sudoers") == "$NEW_SUDOERS_SHA256" ]] || fail 'embedded sudoers hash does not match the reviewed build'
-require_helper_authority "$tmpdir/new-helper" "$tmpdir/new-sudoers"
-bash -n "$tmpdir/new-helper"
-visudo -cf "$tmpdir/new-sudoers"
-
-if [[ ${current_helper_sha256} == "$NEW_HELPER_SHA256" && ${current_sudoers_sha256} == "$NEW_SUDOERS_SHA256" ]]; then
-  require_installed_state "$NEW_HELPER_SHA256" "$NEW_SUDOERS_SHA256"
-  bash -n "$HELPER_PATH"
-  visudo -cf "$SUDOERS_PATH"
-  cmp -s "$tmpdir/new-helper" "$HELPER_PATH" || fail 'installed helper is not the exact reviewed new file'
-  cmp -s "$tmpdir/new-sudoers" "$SUDOERS_PATH" || fail 'installed sudoers is not the exact reviewed new file'
-  printf '%s\n' 'READY: guardian helper and sudoers are already at the reviewed current version'
-  committed=1
-  exit 0
-fi
-
-case "${current_helper_sha256}:${current_sudoers_sha256}" in
-  "${BASELINE_V1_HELPER_SHA256}:${BASELINE_V1_SUDOERS_SHA256}")
-    selected_baseline_helper_sha256=$BASELINE_V1_HELPER_SHA256
-    selected_baseline_sudoers_sha256=$BASELINE_V1_SUDOERS_SHA256
-    ;;
-  "${BASELINE_V2_HELPER_SHA256}:${BASELINE_V2_SUDOERS_SHA256}")
-    selected_baseline_helper_sha256=$BASELINE_V2_HELPER_SHA256
-    selected_baseline_sudoers_sha256=$BASELINE_V2_SUDOERS_SHA256
-    ;;
-  "${BASELINE_V3_HELPER_SHA256}:${BASELINE_V3_SUDOERS_SHA256}")
-    selected_baseline_helper_sha256=$BASELINE_V3_HELPER_SHA256
-    selected_baseline_sudoers_sha256=$BASELINE_V3_SUDOERS_SHA256
-    ;;
-  "${BASELINE_V4_HELPER_SHA256}:${BASELINE_V4_SUDOERS_SHA256}")
-    selected_baseline_helper_sha256=$BASELINE_V4_HELPER_SHA256
-    selected_baseline_sudoers_sha256=$BASELINE_V4_SUDOERS_SHA256
-    ;;
-  "${BASELINE_V5_HELPER_SHA256}:${BASELINE_V5_SUDOERS_SHA256}")
-    selected_baseline_helper_sha256=$BASELINE_V5_HELPER_SHA256
-    selected_baseline_sudoers_sha256=$BASELINE_V5_SUDOERS_SHA256
-    ;;
-  "${BASELINE_V6_HELPER_SHA256}:${BASELINE_V6_SUDOERS_SHA256}")
-    selected_baseline_helper_sha256=$BASELINE_V6_HELPER_SHA256
-    selected_baseline_sudoers_sha256=$BASELINE_V6_SUDOERS_SHA256
-    ;;
-  *) fail 'installed helper and sudoers do not match an exact supported baseline pair; no changes made' ;;
-esac
-
-# Repeat the complete boundary, leaf metadata, and baseline hash checks directly
-# before backup, then prove both private backup copies match that baseline.
-require_installed_state "$selected_baseline_helper_sha256" "$selected_baseline_sudoers_sha256"
-install -m 600 -o root -g root -- "$HELPER_PATH" "$tmpdir/original-helper"
-install -m 600 -o root -g root -- "$SUDOERS_PATH" "$tmpdir/original-sudoers"
-[[ $(file_sha256 "$tmpdir/original-helper") == "$selected_baseline_helper_sha256" ]] || fail 'helper changed while preparing backup'
-[[ $(file_sha256 "$tmpdir/original-sudoers") == "$selected_baseline_sudoers_sha256" ]] || fail 'sudoers changed while preparing backup'
-
-# Repeat once more immediately before installation. Replacement is staged in
-# each verified destination directory and mv -T replaces the leaf itself.
-require_installed_state "$selected_baseline_helper_sha256" "$selected_baseline_sudoers_sha256"
-mutation_started=1
-atomic_replace "$tmpdir/new-helper" "$HELPER_PATH" 0755
-atomic_replace "$tmpdir/new-sudoers" "$SUDOERS_PATH" 0440
-
-require_installed_state "$NEW_HELPER_SHA256" "$NEW_SUDOERS_SHA256"
-bash -n "$HELPER_PATH"
-visudo -cf "$SUDOERS_PATH"
-cmp -s "$tmpdir/new-helper" "$HELPER_PATH" || fail 'installed helper is not the exact reviewed new file'
-cmp -s "$tmpdir/new-sudoers" "$SUDOERS_PATH" || fail 'installed sudoers is not the exact reviewed new file'
-
-committed=1
-printf '%s\n' 'READY: guardian helper and sudoers upgraded from the exact supported baseline'

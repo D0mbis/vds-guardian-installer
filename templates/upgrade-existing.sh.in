@@ -18,6 +18,9 @@ readonly BASELINE_V4_SUDOERS_SHA256='37a03d5d96f9a149acc42240068bf7ddcc3ec766fb1
 # Exact source pair from commit 304d084 (fixtures vds-guardian{ctl,.sudoers}-304d084).
 readonly BASELINE_V5_HELPER_SHA256='26a83ff99dfd63640b0a14d069fdeb0a8235b1c80fefa4d8168d6d3064084fbc'
 readonly BASELINE_V5_SUDOERS_SHA256='d656075f924c9d5b047fa75c8072cdf99e399220b4e858fd435a36e492fb8004'
+# Exact source pair from commit fc50008 (fixtures vds-guardian{ctl,.sudoers}-fc50008).
+readonly BASELINE_V6_HELPER_SHA256='1e01e3f0e10b0a900da09ac5485bf74a4cc9843a47cc2aea921372029d4b5aed'
+readonly BASELINE_V6_SUDOERS_SHA256='7ce85ca65cd4cb384fd514aaad0d00eb8a1ffc50e2a288f07a33f99f0f14eb94'
 readonly NEW_HELPER_SHA256='__NEW_HELPER_SHA256__'
 readonly NEW_SUDOERS_SHA256='__NEW_SUDOERS_SHA256__'
 
@@ -244,6 +247,10 @@ case "${current_helper_sha256}:${current_sudoers_sha256}" in
   "${BASELINE_V5_HELPER_SHA256}:${BASELINE_V5_SUDOERS_SHA256}")
     selected_baseline_helper_sha256=$BASELINE_V5_HELPER_SHA256
     selected_baseline_sudoers_sha256=$BASELINE_V5_SUDOERS_SHA256
+    ;;
+  "${BASELINE_V6_HELPER_SHA256}:${BASELINE_V6_SUDOERS_SHA256}")
+    selected_baseline_helper_sha256=$BASELINE_V6_HELPER_SHA256
+    selected_baseline_sudoers_sha256=$BASELINE_V6_SUDOERS_SHA256
     ;;
   *) fail 'installed helper and sudoers do not match an exact supported baseline pair; no changes made' ;;
 esac
