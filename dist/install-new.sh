@@ -311,6 +311,8 @@ def ftype(m):
 def mtime(s):
  try:return datetime.datetime.fromtimestamp(s.st_mtime_ns//1000000000,datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
  except (OverflowError,OSError,ValueError):bad('unrepresentable object mtime')
+def add_reason(current,new):
+ return '+'.join(dict.fromkeys(filter(None,(current+'+'+new).split('+'))))
 class Scanner:
  def __init__(self,m,d):
   self.mounts=m;self.dev=d;self.count=0;self.sub_count=0;self.sub_exhausted=False;self.global_stop=False;self.stop_reason=''
@@ -351,26 +353,26 @@ class Scanner:
      child=self.node(c,cn,path+b'/'+cn,label+'/'+shown(cn),depth+1,active)
      if child is None:continue
      if child.get('excluded')=='mount':
-      status='partial';reason='mount'
+      status='partial';reason=add_reason(reason,'mount')
       continue
      total+=child['size']
      if child['status']=='partial':
-      status='partial'
-      if not reason:reason=child['reason']
+      status='partial';reason=add_reason(reason,child['reason'])
      if self.sub_exhausted or self.global_stop:break
    except SubtreeLimit:
-    status='partial';reason='entry_limit';self.sub_exhausted=True
+    status='partial';reason=add_reason(reason,'entry_limit');self.sub_exhausted=True
    except DepthLimit:
-    status='partial';reason='depth_limit'
+    status='partial';reason=add_reason(reason,'depth_limit')
    except GlobalLimit as e:
-    status='partial';reason='global_'+e.reason;self.global_stop=True;self.stop_reason=e.reason
+    status='partial';reason=add_reason(reason,'global_'+e.reason);self.global_stop=True;self.stop_reason=e.reason
    finally:os.close(c)
   for x in active:
    if key is None:self.totals[x]+=s.st_blocks*512
    elif key not in self.category_files[x]:self.category_files[x].add(key);self.totals[x]+=s.st_blocks*512
   return {'path':label,'size':total,'status':status,'reason':reason,'owner':'%d:%d'%(s.st_uid,s.st_gid),'mode':'0%o'%stat.S_IMODE(s.st_mode),'type':ftype(s.st_mode),'mtime':mtime(s)}
 def line(n):
- s='path=%s size=%d status=%s owner=%s mode=%s type=%s mtime=%s'%(n['path'],n['size'],n['status'],n['owner'],n['mode'],n['type'],n['mtime'])
+ size_key='size_lower_bound' if n['status']=='partial' else 'size'
+ s='path=%s %s=%d status=%s owner=%s mode=%s type=%s mtime=%s'%(n['path'],size_key,n['size'],n['status'],n['owner'],n['mode'],n['type'],n['mtime'])
  if n['status']=='partial':s+=' reason=%s entries=%d'%(n['reason'],n['entries'])
  return s+'\n'
 def audit(fd,mounts):
@@ -412,7 +414,8 @@ def audit(fd,mounts):
  for p in not_audited[:LIST_MAX]:out.write('not_audited path=%s\n'%p)
  if len(not_audited)>LIST_MAX:out.write('not_audited_more=%d\n'%(len(not_audited)-LIST_MAX))
  cat_status='complete' if (not partials and not excluded and not not_audited and not sc.global_stop) else 'partial'
- for c in CATEGORIES:out.write('category=%s size=%d status=%s\n'%(c,sc.totals[c],cat_status))
+ cat_size_key='size' if cat_status=='complete' else 'size_lower_bound'
+ for c in CATEGORIES:out.write('category=%s %s=%d status=%s\n'%(c,cat_size_key,sc.totals[c],cat_status))
  data=out.getvalue().encode('ascii')
  if len(data)>MAX_REPORT:bad('root storage audit output limit exceeded')
  return data
@@ -946,16 +949,16 @@ VDS_GUARDIAN_HELPER
 cat >"$tmpdir/vds-guardian.sudoers" <<'VDS_GUARDIAN_SUDOERS'
 # Managed capability boundary for the vds-guardian Hermes profile.
 # Every allowed command has fixed arguments; no wildcard or arbitrary path is permitted.
-# vds-guardianctl-sha256: dcf9766e43ee03d1bc9b15912110fe9ec5fb9e36879ac1ca7ac532db5b3ec099
+# vds-guardianctl-sha256: dc4a0cdff43ce5d282e399b2d833a985312eb8f92af5b26ced90ebad5ad4a60d
 Cmnd_Alias VDS_GUARDIAN_AUDIT = /usr/local/sbin/vds-guardianctl audit-compose-projects, /usr/local/sbin/vds-guardianctl audit-root-storage, /usr/local/sbin/vds-guardianctl audit-storage, /usr/local/sbin/vds-guardianctl audit-services, /usr/local/sbin/vds-guardianctl audit-security, /usr/local/sbin/vds-guardianctl verify-health
 Cmnd_Alias VDS_GUARDIAN_CLEAN = /usr/local/sbin/vds-guardianctl clean-apt-cache, /usr/local/sbin/vds-guardianctl vacuum-journal-30d, /usr/local/sbin/vds-guardianctl clean-tmpfiles, /usr/local/sbin/vds-guardianctl clean-docker-build-cache-30d
 Cmnd_Alias VDS_GUARDIAN_MANIFEST_MUTATE = /usr/local/sbin/vds-guardianctl purge-approved-compose-project, /usr/local/sbin/vds-guardianctl quiesce-approved-compose-project, /usr/local/sbin/vds-guardianctl remove-containers-preserve-data
 guardian ALL=(root) NOPASSWD: VDS_GUARDIAN_AUDIT, VDS_GUARDIAN_CLEAN, VDS_GUARDIAN_MANIFEST_MUTATE
 VDS_GUARDIAN_SUDOERS
 
-[[ $(sha256sum -- "$tmpdir/vds-guardianctl") == 'dcf9766e43ee03d1bc9b15912110fe9ec5fb9e36879ac1ca7ac532db5b3ec099  '"$tmpdir/vds-guardianctl" ]] || fail 'embedded helper hash mismatch'
-[[ $(sha256sum -- "$tmpdir/vds-guardian.sudoers") == 'bb21e43d6e7366bf7ffc2de58881f03fe44f8067792741d4d2fd2c263b2a87ef  '"$tmpdir/vds-guardian.sudoers" ]] || fail 'embedded sudoers hash mismatch'
-grep -Fqx -- '# vds-guardianctl-sha256: dcf9766e43ee03d1bc9b15912110fe9ec5fb9e36879ac1ca7ac532db5b3ec099' "$tmpdir/vds-guardian.sudoers" || fail 'sudoers helper authority mismatch'
+[[ $(sha256sum -- "$tmpdir/vds-guardianctl") == 'dc4a0cdff43ce5d282e399b2d833a985312eb8f92af5b26ced90ebad5ad4a60d  '"$tmpdir/vds-guardianctl" ]] || fail 'embedded helper hash mismatch'
+[[ $(sha256sum -- "$tmpdir/vds-guardian.sudoers") == '4a3935103d445b7f8da04f72563fce3db0b25f00bcbfef661d6fef7d9f533198  '"$tmpdir/vds-guardian.sudoers" ]] || fail 'embedded sudoers hash mismatch'
+grep -Fqx -- '# vds-guardianctl-sha256: dc4a0cdff43ce5d282e399b2d833a985312eb8f92af5b26ced90ebad5ad4a60d' "$tmpdir/vds-guardian.sudoers" || fail 'sudoers helper authority mismatch'
 
 printf '%s\n' "$public_key" >"$tmpdir/authorized_key"
 [[ $(wc -l <"$tmpdir/authorized_key") -eq 1 ]] || fail 'public key must be exactly one line'
@@ -982,8 +985,8 @@ install -m 600 -o guardian -g guardian "$tmpdir/authorized_key" /home/guardian/.
 install -m 600 -o guardian -g guardian "$tmpdir/enrollment_token" /home/guardian/.vds-guardian-enrollment
 install -m 755 -o root -g root "$tmpdir/vds-guardianctl" /usr/local/sbin/vds-guardianctl
 install -m 440 -o root -g root "$tmpdir/vds-guardian.sudoers" /etc/sudoers.d/vds-guardian
-[[ $(sha256sum -- /usr/local/sbin/vds-guardianctl) == 'dcf9766e43ee03d1bc9b15912110fe9ec5fb9e36879ac1ca7ac532db5b3ec099  /usr/local/sbin/vds-guardianctl' ]] || fail 'installed helper hash mismatch'
-[[ $(sha256sum -- /etc/sudoers.d/vds-guardian) == 'bb21e43d6e7366bf7ffc2de58881f03fe44f8067792741d4d2fd2c263b2a87ef  /etc/sudoers.d/vds-guardian' ]] || fail 'installed sudoers hash mismatch'
+[[ $(sha256sum -- /usr/local/sbin/vds-guardianctl) == 'dc4a0cdff43ce5d282e399b2d833a985312eb8f92af5b26ced90ebad5ad4a60d  /usr/local/sbin/vds-guardianctl' ]] || fail 'installed helper hash mismatch'
+[[ $(sha256sum -- /etc/sudoers.d/vds-guardian) == '4a3935103d445b7f8da04f72563fce3db0b25f00bcbfef661d6fef7d9f533198  /etc/sudoers.d/vds-guardian' ]] || fail 'installed sudoers hash mismatch'
 visudo -cf /etc/sudoers.d/vds-guardian
 stat -c '%U:%G %a %n' /home/guardian/.ssh /home/guardian/.ssh/authorized_keys /home/guardian/.vds-guardian-enrollment /usr/local/sbin/vds-guardianctl /etc/sudoers.d/vds-guardian
 id guardian

@@ -244,6 +244,8 @@ def ftype(m):
 def mtime(s):
  try:return datetime.datetime.fromtimestamp(s.st_mtime_ns//1000000000,datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
  except (OverflowError,OSError,ValueError):bad('unrepresentable object mtime')
+def add_reason(current,new):
+ return '+'.join(dict.fromkeys(filter(None,(current+'+'+new).split('+'))))
 class Scanner:
  def __init__(self,m,d):
   self.mounts=m;self.dev=d;self.count=0;self.sub_count=0;self.sub_exhausted=False;self.global_stop=False;self.stop_reason=''
@@ -284,26 +286,26 @@ class Scanner:
      child=self.node(c,cn,path+b'/'+cn,label+'/'+shown(cn),depth+1,active)
      if child is None:continue
      if child.get('excluded')=='mount':
-      status='partial';reason='mount'
+      status='partial';reason=add_reason(reason,'mount')
       continue
      total+=child['size']
      if child['status']=='partial':
-      status='partial'
-      if not reason:reason=child['reason']
+      status='partial';reason=add_reason(reason,child['reason'])
      if self.sub_exhausted or self.global_stop:break
    except SubtreeLimit:
-    status='partial';reason='entry_limit';self.sub_exhausted=True
+    status='partial';reason=add_reason(reason,'entry_limit');self.sub_exhausted=True
    except DepthLimit:
-    status='partial';reason='depth_limit'
+    status='partial';reason=add_reason(reason,'depth_limit')
    except GlobalLimit as e:
-    status='partial';reason='global_'+e.reason;self.global_stop=True;self.stop_reason=e.reason
+    status='partial';reason=add_reason(reason,'global_'+e.reason);self.global_stop=True;self.stop_reason=e.reason
    finally:os.close(c)
   for x in active:
    if key is None:self.totals[x]+=s.st_blocks*512
    elif key not in self.category_files[x]:self.category_files[x].add(key);self.totals[x]+=s.st_blocks*512
   return {'path':label,'size':total,'status':status,'reason':reason,'owner':'%d:%d'%(s.st_uid,s.st_gid),'mode':'0%o'%stat.S_IMODE(s.st_mode),'type':ftype(s.st_mode),'mtime':mtime(s)}
 def line(n):
- s='path=%s size=%d status=%s owner=%s mode=%s type=%s mtime=%s'%(n['path'],n['size'],n['status'],n['owner'],n['mode'],n['type'],n['mtime'])
+ size_key='size_lower_bound' if n['status']=='partial' else 'size'
+ s='path=%s %s=%d status=%s owner=%s mode=%s type=%s mtime=%s'%(n['path'],size_key,n['size'],n['status'],n['owner'],n['mode'],n['type'],n['mtime'])
  if n['status']=='partial':s+=' reason=%s entries=%d'%(n['reason'],n['entries'])
  return s+'\n'
 def audit(fd,mounts):
@@ -345,7 +347,8 @@ def audit(fd,mounts):
  for p in not_audited[:LIST_MAX]:out.write('not_audited path=%s\n'%p)
  if len(not_audited)>LIST_MAX:out.write('not_audited_more=%d\n'%(len(not_audited)-LIST_MAX))
  cat_status='complete' if (not partials and not excluded and not not_audited and not sc.global_stop) else 'partial'
- for c in CATEGORIES:out.write('category=%s size=%d status=%s\n'%(c,sc.totals[c],cat_status))
+ cat_size_key='size' if cat_status=='complete' else 'size_lower_bound'
+ for c in CATEGORIES:out.write('category=%s %s=%d status=%s\n'%(c,cat_size_key,sc.totals[c],cat_status))
  data=out.getvalue().encode('ascii')
  if len(data)>MAX_REPORT:bad('root storage audit output limit exceeded')
  return data

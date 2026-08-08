@@ -2,7 +2,8 @@
 set -Eeuo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 IMAGE=${VDS_GUARDIAN_TEST_IMAGE:-debian:12-slim}
-docker run --rm -v "$ROOT:/repo:ro" "$IMAGE" bash -lc '
+DOCKER_RUN=(docker run --rm --cpus=2 --memory=1g --memory-swap=1g --pids-limit=512)
+"${DOCKER_RUN[@]}" -v "$ROOT:/repo:ro" "$IMAGE" bash -lc '
 set -Eeuo pipefail
 apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sudo python3 >/dev/null
@@ -282,4 +283,4 @@ printf "%s\n" manifest_mutations_ok
 # A separate, disposable test container receives CAP_SYS_ADMIN solely to prove
 # that a same-filesystem nested bind mount (with mountinfo-escaped spaces) is
 # rejected before any Docker or filesystem mutation.
-docker run --rm --cap-add SYS_ADMIN --security-opt apparmor=unconfined -v "$ROOT:/repo:ro" "$IMAGE" bash /repo/tests/mount-boundary.sh
+"${DOCKER_RUN[@]}" --cap-add SYS_ADMIN --security-opt apparmor=unconfined -v "$ROOT:/repo:ro" "$IMAGE" bash /repo/tests/mount-boundary.sh

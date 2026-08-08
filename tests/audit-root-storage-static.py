@@ -74,6 +74,7 @@ for required in (
     "directory changed during traversal",
     "object crossed an unrecorded mount boundary",
     "status='partial'",
+    "size_lower_bound",
     "not_audited",
     "excluded path=%s reason=mount",
 ):
@@ -84,7 +85,7 @@ assert "str(e)" not in scanner
 assert "except OSError as" not in scanner
 assert "self.files=set()" in scanner
 assert "self.category_files=" in scanner
-assert "category=%s size=%d status=%s" in scanner
+assert "category=%s %s=%d status=%s" in scanner
 
 # --- Load definitions without executing main(). ---
 namespace: dict[str, object] = {"__name__": "audit_static_test"}
@@ -212,6 +213,7 @@ assert "server.log" in report
 assert "/etc/shadow" not in report  # symlink target is never followed or read
 assert "type=symlink" in report
 for line in completed_lines(report):
+    assert " size=" in line and "size_lower_bound=" not in line
     assert "status=complete" in line and "reason=" not in line
 for category in ("cache", "backups", "Git", "logs", "temp"):
     assert f"category={category} size=" in report
@@ -234,10 +236,12 @@ assert "path=/root/big " in report
 assert "path=/root/small " in report
 big_line = next(line for line in report.splitlines() if line.startswith("path=/root/big "))
 small_line = next(line for line in report.splitlines() if line.startswith("path=/root/small "))
+assert "size_lower_bound=" in big_line and " size=" not in big_line
 assert "status=partial" in big_line and "reason=entry_limit" in big_line and "entries=" in big_line
+assert " size=" in small_line and "size_lower_bound=" not in small_line
 assert "status=complete" in small_line and "reason=" not in small_line
 assert "summary completed=1 partial=1 " in report
-assert "category=cache size=0 status=partial" in report  # categories are partial, not exact
+assert "category=cache size_lower_bound=0 status=partial" in report
 
 # --- Global over-limit: later subtrees are explicitly not audited. ---
 def three_trees(root: pathlib.Path) -> None:
@@ -328,7 +332,7 @@ def with_mount(root: pathlib.Path) -> None:
 report = run_audit(with_mount, mounts={b"/root/mnt"})
 assert "excluded path=/root/mnt reason=mount" in report
 assert "summary completed=1 partial=0 excluded=1 " in report
-assert "category=cache size=0 status=partial" in report  # excluded mount contents are unknown
+assert "category=cache size_lower_bound=0 status=partial" in report
 
 # --- Nested mount inside a subtree makes that subtree partial. ---
 def nested_mount(root: pathlib.Path) -> None:
@@ -340,6 +344,25 @@ def nested_mount(root: pathlib.Path) -> None:
 report = run_audit(nested_mount, mounts={b"/root/sub/mnt"})
 sub_line = next(line for line in report.splitlines() if line.startswith("path=/root/sub "))
 assert "status=partial" in sub_line and "reason=mount" in sub_line
+
+# --- Nested mount and a later subtree limit preserve both unique reasons. ---
+def nested_mount_and_limit(root: pathlib.Path) -> None:
+    (root / "sub" / "a-mnt").mkdir(parents=True)
+    (root / "sub" / "b-mnt").mkdir()
+    limited = root / "sub" / "z-limited"
+    limited.mkdir()
+    for i in range(3):
+        (limited / f"f{i}").write_bytes(b"x")
+
+
+report = run_audit(
+    nested_mount_and_limit,
+    mounts={b"/root/sub/a-mnt", b"/root/sub/b-mnt"},
+    SUBTREE_MAX_ENTRIES=5,
+)
+sub_line = next(line for line in report.splitlines() if line.startswith("path=/root/sub "))
+assert "size_lower_bound=" in sub_line and " size=" not in sub_line
+assert "status=partial" in sub_line and "reason=mount+entry_limit" in sub_line
 
 # --- Generated installer integrity: dist embeds the reviewed source and
 # --- SHA256SUMS verifies the regenerated installers byte-for-byte. ---
