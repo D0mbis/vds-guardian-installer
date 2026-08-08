@@ -141,7 +141,7 @@ import datetime,fcntl,hashlib,io,os,re,stat,sys,time
 ROOT=b'/root'; DIR=os.O_RDONLY|os.O_CLOEXEC|os.O_DIRECTORY|os.O_NOFOLLOW; FILE=os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW
 SUBTREE_MAX_ENTRIES=250000; GLOBAL_MAX_ENTRIES=500000; MAX_DEPTH=64; MAX_SECONDS=120; MAX_REPORT=8388608; TOP_N=64; LIST_MAX=50
 AUTH=re.compile(rb'^# vds-guardianctl-sha256: ([0-9a-f]{64})$')
-SENSITIVE=re.compile(rb'(?:^\\.|secret|token|pass(?:word)?|credential|private|auth|cookie|session|mnemonic|wallet|vault|seed|api[-_.]?key|ssh|gnupg|kubeconfig|id_(?:rsa|dsa|ecdsa|ed25519)|service[-_.]?account|\\.env(?:\\.|$)|(?:^|[-_.])(?:key|pem|p12|pfx|keystore)(?:[-_.]|$))',re.I)
+SENSITIVE=re.compile(rb'(?:^\.|secret|token|pass(?:word)?|credential|private|auth|cookie|session|mnemonic|wallet|vault|seed|api[-_.]?key|ssh|gnupg|kubeconfig|id_(?:rsa|dsa|ecdsa|ed25519)|service[-_.]?account|\.env(?:\.|$)|(?:^|[-_.])(?:key|pem|p12|pfx|keystore)(?:[-_.]|$))',re.I)
 CATEGORIES=('cache','backups','Git','logs','temp')
 class Bad(Exception):pass
 class SubtreeLimit(Exception):pass
@@ -296,7 +296,7 @@ class Scanner:
    except DepthLimit:
     status='partial';reason='depth_limit'
    except GlobalLimit as e:
-    status='partial';reason='global_entry_limit';self.global_stop=True;self.stop_reason=e.reason
+    status='partial';reason='global_'+e.reason;self.global_stop=True;self.stop_reason=e.reason
    finally:os.close(c)
   for x in active:
    if key is None:self.totals[x]+=s.st_blocks*512
@@ -329,6 +329,9 @@ def audit(fd,mounts):
   else:completed.append(x)
  out=io.StringIO()
  out.write('audit=root-storage progressive=1 limits subtree=%d global=%d depth=%d top=%d\n'%(SUBTREE_MAX_ENTRIES,GLOBAL_MAX_ENTRIES,MAX_DEPTH,TOP_N))
+ # When the global budget or deadline expires before top-level enumeration
+ # completes, the number of unvisited top-level subtrees is unknown, so the
+ # summary reports the literal sentinel 'unbounded' instead of a fake count.
  na='unbounded' if (sc.global_stop and not top) else str(len(not_audited))
  out.write('summary completed=%d partial=%d excluded=%d not_audited=%s entries=%d\n'%(len(completed),len(partials),len(excluded),na,sc.count))
  if sc.global_stop:out.write('limit=%s\n'%sc.stop_reason)

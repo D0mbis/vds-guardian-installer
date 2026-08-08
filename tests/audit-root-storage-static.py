@@ -101,8 +101,24 @@ audit = cast(Callable[..., bytes], namespace["audit"])
 
 # --- Redaction and category classification units. ---
 assert shown(b"project-1") == "project-1"
-for sensitive in (b".ssh", b"api_token", b"passwords", b"client.key", b"vault", b"bad\nname", b"unicode-\xff"):
-    assert shown(sensitive) == "<redacted>"
+# Env-suffixed names rely on the \.env(?:\.|$) alternative alone (they do not
+# start with a dot), so a broken dot escape cannot hide behind the ^\. prefix
+# alternative; dot-dependent names rely on ^\. alone (they are not env files).
+# Together they prove the two dot alternatives are restored without overlap.
+for sensitive in (
+    b".ssh", b"api_token", b"passwords", b"client.key", b"vault",
+    b"bad\nname", b"unicode-\xff",
+    b"production.env", b"staging.env.prod", b"app.env",  # env-suffixed token
+    b".env", b".env.prod",  # canonical env-file names
+    b".git", b".cache", b".hidden",  # dot-prefixed names
+):
+    assert shown(sensitive) == "<redacted>", sensitive
+# Dot-dependence is conservative: .env must be a literal dot plus a complete
+# env token, so plain "env" words and dotted non-env tokens stay visible.
+# This guards against over-redaction and overlapping alternatives masking a
+# broken escape (e.g. an unescaped dot matching "xenv" anywhere).
+for plain in (b"environment", b"production.environment", b"envfile", b"myenv", b"plain", b"backups"):
+    assert shown(plain) == plain.decode(), plain
 assert unescape(b"/root/a\\040b") == b"/root/a b"
 assert "cache" in categories(b"pip-cache")
 assert "backups" in categories(b"database.tar.gz")
@@ -238,10 +254,40 @@ assert "summary completed=1 partial=1 excluded=0 not_audited=1 " in report
 b_line = next(line for line in report.splitlines() if line.startswith("path=/root/b "))
 assert "status=partial" in b_line and "reason=global_entry_limit" in b_line
 
-# --- Time budget: a zero/negative deadline fails the whole run with markers. ---
+# --- Time budget: a zero/negative deadline fails the whole run with markers.
+# --- not_audited=unbounded is the documented sentinel for this case: the
+# --- global stop happened before top-level enumeration completed, so the
+# --- number of unvisited top-level subtrees is unknown and a fake count
+# --- would be misleading.
 report = run_audit(base_tree, MAX_SECONDS=-1)
 assert "summary completed=0 partial=0 excluded=0 not_audited=unbounded " in report
 assert "limit=time_limit" in report
+
+# --- Time budget mid-subtree: the partial reason is truthful. A fake clock
+# --- makes the deadline deterministic: monotonic() calls are init(1),
+# --- top-level names(2-5), node(a) entry(6), then the first subtree reserve(7)
+# --- trips check() past the deadline while node(a) is still being scanned.
+class FakeMonotonic:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def monotonic(self) -> float:
+        self.calls += 1
+        return 0.0 if self.calls <= 6 else 1001.0
+
+
+def two_trees(root: pathlib.Path) -> None:
+    (root / "a").mkdir()
+    (root / "a" / "f").write_bytes(b"x")
+    (root / "b").mkdir()
+
+
+report = run_audit(two_trees, time=FakeMonotonic())
+a_line = next(line for line in report.splitlines() if line.startswith("path=/root/a "))
+assert "status=partial" in a_line and "reason=global_time_limit" in a_line and "entries=1" in a_line
+assert "not_audited path=/root/b" in report
+assert "limit=time_limit" in report
+assert "summary completed=0 partial=1 excluded=0 not_audited=1 " in report
 
 # --- Depth bound: too-deep subtrees are partial, never exact. ---
 def deep_chain(root: pathlib.Path) -> None:

@@ -18,8 +18,8 @@ readonly BASELINE_V4_SUDOERS_SHA256='37a03d5d96f9a149acc42240068bf7ddcc3ec766fb1
 # Exact source pair from commit 304d084 (fixtures vds-guardian{ctl,.sudoers}-304d084).
 readonly BASELINE_V5_HELPER_SHA256='26a83ff99dfd63640b0a14d069fdeb0a8235b1c80fefa4d8168d6d3064084fbc'
 readonly BASELINE_V5_SUDOERS_SHA256='d656075f924c9d5b047fa75c8072cdf99e399220b4e858fd435a36e492fb8004'
-readonly NEW_HELPER_SHA256='1c3a32d7bc6212b21d67cbbe1c3d3855875746670959cc9b595777c99f60e7ae'
-readonly NEW_SUDOERS_SHA256='9efe5dc71246b7ae3e27a6b2e3e23d224bbdd60a01b5ee4f46cfe90d7fd1b3d7'
+readonly NEW_HELPER_SHA256='dcf9766e43ee03d1bc9b15912110fe9ec5fb9e36879ac1ca7ac532db5b3ec099'
+readonly NEW_SUDOERS_SHA256='bb21e43d6e7366bf7ffc2de58881f03fe44f8067792741d4d2fd2c263b2a87ef'
 
 fail() {
   printf 'ERROR: %s\n' "$*" >&2
@@ -343,7 +343,7 @@ import datetime,fcntl,hashlib,io,os,re,stat,sys,time
 ROOT=b'/root'; DIR=os.O_RDONLY|os.O_CLOEXEC|os.O_DIRECTORY|os.O_NOFOLLOW; FILE=os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW
 SUBTREE_MAX_ENTRIES=250000; GLOBAL_MAX_ENTRIES=500000; MAX_DEPTH=64; MAX_SECONDS=120; MAX_REPORT=8388608; TOP_N=64; LIST_MAX=50
 AUTH=re.compile(rb'^# vds-guardianctl-sha256: ([0-9a-f]{64})$')
-SENSITIVE=re.compile(rb'(?:^\\.|secret|token|pass(?:word)?|credential|private|auth|cookie|session|mnemonic|wallet|vault|seed|api[-_.]?key|ssh|gnupg|kubeconfig|id_(?:rsa|dsa|ecdsa|ed25519)|service[-_.]?account|\\.env(?:\\.|$)|(?:^|[-_.])(?:key|pem|p12|pfx|keystore)(?:[-_.]|$))',re.I)
+SENSITIVE=re.compile(rb'(?:^\.|secret|token|pass(?:word)?|credential|private|auth|cookie|session|mnemonic|wallet|vault|seed|api[-_.]?key|ssh|gnupg|kubeconfig|id_(?:rsa|dsa|ecdsa|ed25519)|service[-_.]?account|\.env(?:\.|$)|(?:^|[-_.])(?:key|pem|p12|pfx|keystore)(?:[-_.]|$))',re.I)
 CATEGORIES=('cache','backups','Git','logs','temp')
 class Bad(Exception):pass
 class SubtreeLimit(Exception):pass
@@ -498,7 +498,7 @@ class Scanner:
    except DepthLimit:
     status='partial';reason='depth_limit'
    except GlobalLimit as e:
-    status='partial';reason='global_entry_limit';self.global_stop=True;self.stop_reason=e.reason
+    status='partial';reason='global_'+e.reason;self.global_stop=True;self.stop_reason=e.reason
    finally:os.close(c)
   for x in active:
    if key is None:self.totals[x]+=s.st_blocks*512
@@ -531,6 +531,9 @@ def audit(fd,mounts):
   else:completed.append(x)
  out=io.StringIO()
  out.write('audit=root-storage progressive=1 limits subtree=%d global=%d depth=%d top=%d\n'%(SUBTREE_MAX_ENTRIES,GLOBAL_MAX_ENTRIES,MAX_DEPTH,TOP_N))
+ # When the global budget or deadline expires before top-level enumeration
+ # completes, the number of unvisited top-level subtrees is unknown, so the
+ # summary reports the literal sentinel 'unbounded' instead of a fake count.
  na='unbounded' if (sc.global_stop and not top) else str(len(not_audited))
  out.write('summary completed=%d partial=%d excluded=%d not_audited=%s entries=%d\n'%(len(completed),len(partials),len(excluded),na,sc.count))
  if sc.global_stop:out.write('limit=%s\n'%sc.stop_reason)
@@ -1078,7 +1081,7 @@ VDS_GUARDIAN_HELPER
 cat >"$tmpdir/new-sudoers" <<'VDS_GUARDIAN_SUDOERS'
 # Managed capability boundary for the vds-guardian Hermes profile.
 # Every allowed command has fixed arguments; no wildcard or arbitrary path is permitted.
-# vds-guardianctl-sha256: 1c3a32d7bc6212b21d67cbbe1c3d3855875746670959cc9b595777c99f60e7ae
+# vds-guardianctl-sha256: dcf9766e43ee03d1bc9b15912110fe9ec5fb9e36879ac1ca7ac532db5b3ec099
 Cmnd_Alias VDS_GUARDIAN_AUDIT = /usr/local/sbin/vds-guardianctl audit-compose-projects, /usr/local/sbin/vds-guardianctl audit-root-storage, /usr/local/sbin/vds-guardianctl audit-storage, /usr/local/sbin/vds-guardianctl audit-services, /usr/local/sbin/vds-guardianctl audit-security, /usr/local/sbin/vds-guardianctl verify-health
 Cmnd_Alias VDS_GUARDIAN_CLEAN = /usr/local/sbin/vds-guardianctl clean-apt-cache, /usr/local/sbin/vds-guardianctl vacuum-journal-30d, /usr/local/sbin/vds-guardianctl clean-tmpfiles, /usr/local/sbin/vds-guardianctl clean-docker-build-cache-30d
 Cmnd_Alias VDS_GUARDIAN_MANIFEST_MUTATE = /usr/local/sbin/vds-guardianctl purge-approved-compose-project, /usr/local/sbin/vds-guardianctl quiesce-approved-compose-project, /usr/local/sbin/vds-guardianctl remove-containers-preserve-data
